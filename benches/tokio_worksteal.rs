@@ -13,8 +13,8 @@ mod alloc_setup;
 use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
@@ -78,10 +78,7 @@ fn main() {
             }
 
             // Wait for in-flight tasks to drain
-            let _ = semaphore
-                .clone()
-                .acquire_many(concurrency as u32)
-                .await;
+            let _ = semaphore.clone().acquire_many(concurrency as u32).await;
 
             spawned
         })
@@ -92,7 +89,10 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64();
     let total_bytes = bytes_allocated.load(Ordering::Relaxed);
 
-    println!("tokio work-stealing benchmark ({})", alloc_setup::allocator_name());
+    println!(
+        "tokio work-stealing benchmark ({})",
+        alloc_setup::allocator_name()
+    );
     println!("  workers:      {cpus}");
     println!("  concurrency:  {concurrency} tasks");
     println!("  buf range:    {buf_min}-{buf_max} bytes");
@@ -118,7 +118,9 @@ async fn handle_request(
     work_iters: usize,
 ) {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-    let buf_len = rng.random_range(buf_min..buf_max.max(buf_min + 1)).div_ceil(8);
+    let buf_len = rng
+        .random_range(buf_min..buf_max.max(buf_min + 1))
+        .div_ceil(8);
 
     // Allocate request buffer (align 8 via u64, no zeroing)
     let mut buf = Box::<[u64]>::new_uninit_slice(buf_len);
@@ -143,7 +145,9 @@ async fn handle_request(
 
     // Phase 3: allocate response buffer, copy some data
     if rng.random_ratio(2, 3) {
-        let resp_len = rng.random_range(buf_min..buf_max.max(buf_min + 1)).div_ceil(8);
+        let resp_len = rng
+            .random_range(buf_min..buf_max.max(buf_min + 1))
+            .div_ceil(8);
         let mut resp = Box::<[u64]>::new_uninit_slice(resp_len);
         bytes_allocated.fetch_add((resp_len * size_of::<u64>()) as u64, Ordering::Relaxed);
 

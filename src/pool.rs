@@ -13,7 +13,7 @@ use core::mem::{align_of, size_of};
 use core::ptr::{NonNull, null_mut};
 
 use crate::size_class::NUM_CLASSES;
-use crate::slab::{Slab, SlabBase, SLAB_SIZE};
+use crate::slab::{SLAB_SIZE, Slab, SlabBase};
 use crate::sys::PageAllocator;
 
 const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
@@ -157,9 +157,7 @@ impl<P: PageAllocator> PagePool<P> {
         let seg = Self::find_segment(&state, slab as usize);
         state.seg_outstanding[seg] -= 1;
 
-        if state.seg_outstanding[seg] == 0
-            && Self::segment_fully_carved(&state, seg)
-        {
+        if state.seg_outstanding[seg] == 0 && Self::segment_fully_carved(&state, seg) {
             let segment_ptr = state.segments[seg];
             Self::remove_segment_slabs(&mut state, segment_ptr as usize);
             Self::swap_remove_segment(&mut state, seg);

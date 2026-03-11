@@ -84,7 +84,10 @@ fn main() {
 
     let elapsed = start.elapsed();
 
-    println!("cache-scratch benchmark ({})", alloc_setup::allocator_name());
+    println!(
+        "cache-scratch benchmark ({})",
+        alloc_setup::allocator_name()
+    );
     println!("  threads:      {nthreads}");
     println!("  obj_size:     {obj_size} bytes");
     println!("  iterations:   {iterations}");

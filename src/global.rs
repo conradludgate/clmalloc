@@ -55,8 +55,7 @@ mod imp {
         let ret = unsafe { libc::pthread_key_create(&mut key, Some(heap_destructor)) };
         assert_eq!(ret, 0, "pthread_key_create failed");
 
-        match PTHREAD_KEY.compare_exchange(-1, key as isize, Ordering::Release, Ordering::Acquire)
-        {
+        match PTHREAD_KEY.compare_exchange(-1, key as isize, Ordering::Release, Ordering::Acquire) {
             Ok(_) => key,
             Err(existing) => {
                 unsafe { libc::pthread_key_delete(key) };

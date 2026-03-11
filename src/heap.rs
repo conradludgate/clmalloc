@@ -19,12 +19,12 @@
 //! the cost of atomic CAS operations across many frees.
 
 use core::alloc::Layout;
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::pool::PagePool;
 use crate::size_class::{self, NUM_CLASSES};
-use crate::slab::{self, Slab, SlabBase, SlabRef, SLAB_MASK};
+use crate::slab::{self, SLAB_MASK, Slab, SlabBase, SlabRef};
 use crate::sys::PageAllocator;
 
 static NEXT_HEAP_ID: AtomicUsize = AtomicUsize::new(1);
@@ -39,13 +39,13 @@ const CACHE_CAP: usize = 64;
 
 // r[impl heap.free-cache]
 struct FreeCache {
-    entries: [*mut u8; CACHE_CAP],
+    entries: [NonNull<u8>; CACHE_CAP],
     count: u8,
 }
 
 impl FreeCache {
     const EMPTY: Self = Self {
-        entries: [ptr::null_mut(); CACHE_CAP],
+        entries: [NonNull::dangling(); CACHE_CAP],
         count: 0,
     };
 
@@ -55,13 +55,13 @@ impl FreeCache {
             return None;
         }
         self.count -= 1;
-        NonNull::new(self.entries[self.count as usize])
+        Some(self.entries[self.count as usize])
     }
 
     #[inline]
     fn push(&mut self, ptr: NonNull<u8>) {
         debug_assert!((self.count as usize) < CACHE_CAP);
-        self.entries[self.count as usize] = ptr.as_ptr();
+        self.entries[self.count as usize] = ptr;
         self.count += 1;
     }
 
@@ -176,7 +176,9 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
                 self.pool.dealloc_slab(slab.into_raw());
                 continue;
             }
-            if result.is_none() && let Some(ptr) = slab.alloc() {
+            if result.is_none()
+                && let Some(ptr) = slab.alloc()
+            {
                 self.bins[class_idx] = Some(slab);
                 result = Some(ptr);
                 continue;
@@ -322,7 +324,10 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         for i in 1..n {
             let key = entries[i];
             let mut j = i;
-            while j > 0 && (entries[j - 1] as usize & SLAB_MASK) > (key as usize & SLAB_MASK) {
+            while j > 0
+                && (entries[j - 1].as_ptr() as usize & SLAB_MASK)
+                    > (key.as_ptr() as usize & SLAB_MASK)
+            {
                 entries[j] = entries[j - 1];
                 j -= 1;
             }
@@ -331,32 +336,30 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
 
         let mut i = 0;
         while i < n {
-            let slab_base_addr = entries[i] as usize & SLAB_MASK;
+            let slab_base_addr = entries[i].as_ptr() as usize & SLAB_MASK;
             let slab_base = unsafe { NonNull::new_unchecked(slab_base_addr as *mut SlabBase) };
 
             // Collect the run of entries for this slab.
             let run_start = i;
             i += 1;
-            while i < n && (entries[i] as usize & SLAB_MASK) == slab_base_addr {
+            while i < n && (entries[i].as_ptr() as usize & SLAB_MASK) == slab_base_addr {
                 i += 1;
             }
 
             // Check ownership via heap_id in the slab header.
-            let slab_ref = unsafe { SlabRef::from_interior_ptr(entries[run_start]) };
+            let slab_ref = unsafe { SlabRef::from_interior_ptr(entries[run_start].as_ptr()) };
             if slab_ref.heap_id() == self.id {
                 // Own slab: push each entry directly to the local free list.
                 let mut slab = unsafe { Slab::from_raw(slab_base) };
                 for e in &entries[run_start..i] {
-                    slab.dealloc_local(unsafe { NonNull::new_unchecked(*e) });
+                    slab.dealloc_local(*e);
                 }
             } else {
                 // Remote slab: chain entries and push the chain in one CAS.
                 for j in run_start..i - 1 {
-                    unsafe { slab::write_next(entries[j], entries[j + 1]) };
+                    unsafe { slab::write_next(entries[j], entries[j + 1].as_ptr()) };
                 }
-                let first = entries[run_start];
-                let last = entries[i - 1];
-                slab_ref.push_chain_remote(first, last);
+                slab_ref.push_chain_remote(entries[run_start], entries[i - 1]);
             }
         }
 
@@ -466,7 +469,10 @@ mod tests {
 
         let next = heap.alloc(layout).unwrap();
         let next_slab_ref = unsafe { SlabRef::from_interior_ptr(next.as_ptr()) };
-        assert!(!first_slab_ref.header_eq(&next_slab_ref), "should be a different slab");
+        assert!(
+            !first_slab_ref.header_eq(&next_slab_ref),
+            "should be a different slab"
+        );
 
         unsafe { heap.dealloc(next, layout) };
         for ptr in ptrs {
@@ -656,7 +662,10 @@ mod tests {
         let ptr2 = heap2.alloc(layout).unwrap();
         let slab_ref1 = unsafe { SlabRef::from_interior_ptr(outstanding_ptr.as_ptr()) };
         let slab_ref2 = unsafe { SlabRef::from_interior_ptr(ptr2.as_ptr()) };
-        assert!(slab_ref1.header_eq(&slab_ref2), "heap2 should adopt heap1's slab");
+        assert!(
+            slab_ref1.header_eq(&slab_ref2),
+            "heap2 should adopt heap1's slab"
+        );
 
         // heap_id should now be heap2's
         assert_eq!(slab_ref2.heap_id(), heap2.id());
@@ -717,7 +726,10 @@ mod tests {
         let new_ptr = heap2.alloc(layout).unwrap();
         let new_slab_ref = unsafe { SlabRef::from_interior_ptr(new_ptr.as_ptr()) };
         let old_slab_ref = unsafe { SlabRef::from_interior_ptr(raw_ptrs[0] as *const u8) };
-        assert!(old_slab_ref.header_eq(&new_slab_ref), "should adopt the abandoned slab");
+        assert!(
+            old_slab_ref.header_eq(&new_slab_ref),
+            "should adopt the abandoned slab"
+        );
 
         // Free everything
         for raw in &raw_ptrs {

@@ -79,7 +79,10 @@ mod tests {
             assert!(cs >= size, "class {idx} size {cs} < requested {size}");
             if idx > 0 {
                 let prev = class_size(idx - 1);
-                assert!(prev < size, "previous class {prev} fits {size}, should have picked it");
+                assert!(
+                    prev < size,
+                    "previous class {prev} fits {size}, should have picked it"
+                );
             }
         }
     }
@@ -166,7 +169,10 @@ mod tests {
             let cs = class_size(idx);
             let round_trip_layout = Layout::from_size_align(cs, 1).unwrap();
             let idx2 = class_index(round_trip_layout).unwrap();
-            assert_eq!(idx, idx2, "round-trip failed for size {size}: {idx} != {idx2}");
+            assert_eq!(
+                idx, idx2,
+                "round-trip failed for size {size}: {idx} != {idx2}"
+            );
         }
     }
 

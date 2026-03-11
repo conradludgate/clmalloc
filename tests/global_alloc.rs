@@ -82,7 +82,9 @@ fn null_on_impossible_layout() {
 // r[verify dealloc.layout-trusted] r[verify dealloc.local-fast-path]
 #[test]
 fn alloc_dealloc_many_sizes() {
-    for size in [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768] {
+    for size in [
+        8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+    ] {
         let layout = std::alloc::Layout::from_size_align(size, 1).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) };
         assert!(!ptr.is_null(), "alloc failed for size {size}");

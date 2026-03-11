@@ -50,13 +50,13 @@ pub struct SlabBase([u8; SLAB_SIZE]);
 type Link = *mut u8;
 
 #[inline(always)]
-unsafe fn read_next(slot: *mut u8) -> Link {
-    unsafe { slot.cast::<Link>().read_unaligned() }
+unsafe fn read_next(slot: NonNull<u8>) -> Link {
+    unsafe { slot.as_ptr().cast::<Link>().read_unaligned() }
 }
 
 #[inline(always)]
-pub(crate) unsafe fn write_next(slot: *mut u8, next: Link) {
-    unsafe { slot.cast::<Link>().write_unaligned(next) };
+pub(crate) unsafe fn write_next(slot: NonNull<u8>, next: Link) {
+    unsafe { slot.as_ptr().cast::<Link>().write_unaligned(next) };
 }
 
 struct LocalState {
@@ -244,13 +244,10 @@ impl Slab {
         // Fast path: pop from the local free list (recycled slots).
         let ptr = header.local.with_mut(|p| {
             let local = unsafe { &mut *p };
-            let head = local.head;
-            if head.is_null() {
-                return None;
-            }
+            let head = NonNull::new(local.head)?;
             local.head = unsafe { read_next(head) };
             local.free_count -= 1;
-            Some(unsafe { NonNull::new_unchecked(head) })
+            Some(head)
         });
         if ptr.is_some() {
             return ptr;
@@ -275,7 +272,7 @@ impl Slab {
     pub fn dealloc_local(&mut self, ptr: NonNull<u8>) {
         self.header().local.with_mut(|p| {
             let local = unsafe { &mut *p };
-            unsafe { write_next(ptr.as_ptr(), local.head) };
+            unsafe { write_next(ptr, local.head) };
             local.head = ptr.as_ptr();
             local.free_count += 1;
         })
@@ -299,9 +296,9 @@ impl Slab {
             let local = unsafe { &mut *p };
             let mut count = 0u16;
             let mut cursor = chain;
-            while !cursor.is_null() {
-                let next = unsafe { read_next(cursor) };
-                unsafe { write_next(cursor, local.head) };
+            while let Some(slot) = NonNull::new(cursor) {
+                let next = unsafe { read_next(slot) };
+                unsafe { write_next(slot, local.head) };
                 local.head = cursor;
                 local.free_count += 1;
                 count += 1;
@@ -381,13 +378,12 @@ impl SlabRef {
     /// O(1) amortized (CAS retry loop).
     pub fn dealloc_remote(&self, ptr: NonNull<u8>) {
         let header = self.header();
-        let slot = ptr.as_ptr();
         let mut head = header.remote_head.load(Ordering::Relaxed);
         loop {
-            unsafe { write_next(slot, head) };
+            unsafe { write_next(ptr, head) };
             match header.remote_head.compare_exchange_weak(
                 head,
-                slot,
+                ptr.as_ptr(),
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
@@ -400,14 +396,14 @@ impl SlabRef {
     /// Push a pre-chained list `[first -> ... -> last]` onto the remote
     /// free list in a single CAS. Used by the free cache flush to batch
     /// multiple frees into one atomic operation per slab.
-    pub fn push_chain_remote(&self, first: *mut u8, last: *mut u8) {
+    pub fn push_chain_remote(&self, first: NonNull<u8>, last: NonNull<u8>) {
         let header = self.header();
         let mut head = header.remote_head.load(Ordering::Relaxed);
         loop {
             unsafe { write_next(last, head) };
             match header.remote_head.compare_exchange_weak(
                 head,
-                first,
+                first.as_ptr(),
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
@@ -421,7 +417,7 @@ impl SlabRef {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::collections::HashSet;
 
     struct TestSlab {
@@ -435,7 +431,9 @@ mod tests {
             let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
             let ptr = unsafe {
                 let p = alloc_zeroed(layout);
-                NonNull::new(p).expect("aligned alloc failed").cast::<SlabBase>()
+                NonNull::new(p)
+                    .expect("aligned alloc failed")
+                    .cast::<SlabBase>()
             };
             let slab = unsafe { Slab::init(ptr, size_class_index, 0) };
             Self { slab, ptr, layout }
@@ -505,9 +503,9 @@ mod tests {
         fn assert_send<T: Send>() {}
         fn assert_not_sync<T>()
         where
-            // T must NOT implement Sync — this compiles only if T: !Sync,
-            // by requiring a bound that would conflict. We use a negative
-            // reasoning trick: PhantomData<Cell<()>> ensures !Sync.
+        // T must NOT implement Sync — this compiles only if T: !Sync,
+        // by requiring a bound that would conflict. We use a negative
+        // reasoning trick: PhantomData<Cell<()>> ensures !Sync.
         {
         }
         assert_send::<Slab>();
@@ -632,7 +630,9 @@ mod tests {
         let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
         let base = unsafe {
             let p = alloc_zeroed(layout);
-            NonNull::new(p).expect("aligned alloc failed").cast::<SlabBase>()
+            NonNull::new(p)
+                .expect("aligned alloc failed")
+                .cast::<SlabBase>()
         };
         let slab = unsafe { Slab::init(base, 0, 0) };
         let returned = slab.into_raw();
@@ -651,14 +651,16 @@ mod loom_tests {
         let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
         let base = unsafe {
             let p = std::alloc::alloc_zeroed(layout);
-            NonNull::new(p).expect("aligned alloc failed")
+            NonNull::new(p)
+                .expect("aligned alloc failed")
+                .cast::<SlabBase>()
         };
         let mut slab = unsafe { Slab::init(base, size_class_index, 0) };
         f(&mut slab);
         drop(slab);
         unsafe {
             ptr::drop_in_place(base.as_ptr().cast::<SlabHeader>());
-            std::alloc::dealloc(base.as_ptr(), layout);
+            std::alloc::dealloc(base.as_ptr().cast(), layout);
         }
     }
 
