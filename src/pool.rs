@@ -44,6 +44,12 @@ struct PoolState {
     /// heap or on the abandoned list — i.e. not on the free list and not
     /// still uncarved).
     seg_outstanding: [u8; MAX_SEGMENTS],
+    /// Slabs currently handed out (not on the free list or uncarved).
+    #[cfg(feature = "metrics")]
+    outstanding_slabs: u64,
+    /// Bytes currently mmap'd for large allocations (bypassing the slab system).
+    #[cfg(feature = "metrics")]
+    large_mapped_bytes: u64,
     #[cfg(feature = "metrics")]
     metrics: crate::metrics::PoolMetrics,
 }
@@ -74,6 +80,10 @@ impl<P: PageAllocator> PagePool<P> {
                 segment_count: 0,
                 seg_outstanding: [0; MAX_SEGMENTS],
                 #[cfg(feature = "metrics")]
+                outstanding_slabs: 0,
+                #[cfg(feature = "metrics")]
+                large_mapped_bytes: 0,
+                #[cfg(feature = "metrics")]
                 metrics: crate::metrics::PoolMetrics::new(),
             }),
         }
@@ -99,6 +109,10 @@ impl<P: PageAllocator> PagePool<P> {
             state.free_head = unsafe { slab.cast::<Link>().read() };
             let seg = Self::find_segment(&state, slab as usize);
             state.seg_outstanding[seg] += 1;
+            #[cfg(feature = "metrics")]
+            {
+                state.outstanding_slabs += 1;
+            }
             // SAFETY: slab is non-null (we checked free_head above).
             return Some(unsafe { NonNull::new_unchecked(slab.cast()) });
         }
@@ -109,6 +123,10 @@ impl<P: PageAllocator> PagePool<P> {
             state.segment_cursor = unsafe { slab.add(1) };
             let seg = state.carving_idx;
             state.seg_outstanding[seg] += 1;
+            #[cfg(feature = "metrics")]
+            {
+                state.outstanding_slabs += 1;
+            }
             // SAFETY: slab is non-null (segment_cursor < segment_end).
             return Some(unsafe { NonNull::new_unchecked(slab.cast()) });
         }
@@ -141,6 +159,10 @@ impl<P: PageAllocator> PagePool<P> {
         state.segments[seg_idx] = base.as_ptr().cast();
         state.segment_count = seg_idx + 1;
         state.seg_outstanding[seg_idx] = 1;
+        #[cfg(feature = "metrics")]
+        {
+            state.outstanding_slabs += 1;
+        }
 
         if state.segment_cursor < state.segment_end {
             // Another thread set up a carving segment while we were in mmap.
@@ -184,6 +206,10 @@ impl<P: PageAllocator> PagePool<P> {
 
         let seg = Self::find_segment(&state, slab as usize);
         state.seg_outstanding[seg] -= 1;
+        #[cfg(feature = "metrics")]
+        {
+            state.outstanding_slabs -= 1;
+        }
 
         if state.seg_outstanding[seg] == 0 && Self::segment_fully_carved(&state, seg) {
             let segment_ptr = state.segments[seg];
@@ -308,7 +334,12 @@ impl<P: PageAllocator> PagePool<P> {
     /// Delegates directly to the page allocator; no pooling.
     #[cold]
     pub fn alloc_large(&self, layout: Layout) -> Option<NonNull<u8>> {
-        self.page_alloc.alloc(layout)
+        let ptr = self.page_alloc.alloc(layout)?;
+        #[cfg(feature = "metrics")]
+        {
+            self.state.lock().large_mapped_bytes += layout.size() as u64;
+        }
+        Some(ptr)
     }
 
     // r[impl pool.large-dealloc]
@@ -318,6 +349,10 @@ impl<P: PageAllocator> PagePool<P> {
     /// `ptr` must have been returned by `alloc_large` with the same `layout`.
     #[cold]
     pub unsafe fn dealloc_large(&self, ptr: NonNull<u8>, layout: Layout) {
+        #[cfg(feature = "metrics")]
+        {
+            self.state.lock().large_mapped_bytes -= layout.size() as u64;
+        }
         // SAFETY: caller guarantees ptr came from alloc_large with this layout.
         unsafe { self.page_alloc.dealloc(ptr, layout) };
     }
@@ -334,13 +369,18 @@ impl<P: PageAllocator> PagePool<P> {
     }
 
     // r[impl metrics.global-snapshot] r[impl metrics.global-mapped]
+    // r[impl metrics.global-active]
     pub fn snapshot(&self) -> crate::metrics::MetricsSnapshot {
         let mut snap = crate::metrics::MetricsSnapshot::new();
         let state = self.state.lock();
-        snap.mapped = state.segment_count as u64 * SEGMENT_SIZE as u64;
+        snap.mapped = state.segment_count as u64 * SEGMENT_SIZE as u64
+            + state.large_mapped_bytes;
+        let outstanding_slabs = state.outstanding_slabs;
         state.metrics.aggregate_heap_metrics(&mut snap);
         drop(state);
         snap.finalize();
+        let large_live = snap.large_alloc_bytes.saturating_sub(snap.large_dealloc_bytes);
+        snap.active = outstanding_slabs * SLAB_SIZE as u64 + large_live;
         snap
     }
 }

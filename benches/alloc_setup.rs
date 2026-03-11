@@ -7,7 +7,7 @@
 
 #[cfg(feature = "clmalloc")]
 #[global_allocator]
-static ALLOC: clmalloc::ClMalloc = clmalloc::ClMalloc::new();
+pub static ALLOC: clmalloc::ClMalloc = clmalloc::ClMalloc::new();
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]

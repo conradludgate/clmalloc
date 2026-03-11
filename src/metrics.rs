@@ -29,6 +29,7 @@ fn inc(a: &AtomicU64, v: u64) {
 // r[impl metrics.class-alloc-bytes] r[impl metrics.class-free-bytes]
 // r[impl metrics.cache-hit-count] r[impl metrics.cache-flush-count]
 // r[impl metrics.large-alloc-count] r[impl metrics.large-alloc-bytes]
+// r[impl metrics.large-dealloc-bytes]
 // r[impl metrics.remote-free-count]
 // r[impl metrics.histogram-storage]
 pub(crate) struct HeapMetrics {
@@ -46,6 +47,7 @@ pub(crate) struct HeapMetrics {
     pub remote_free_count: AtomicU64,
     pub large_alloc_count: AtomicU64,
     pub large_alloc_bytes: AtomicU64,
+    pub large_dealloc_bytes: AtomicU64,
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -66,6 +68,7 @@ impl HeapMetrics {
         remote_free_count: AtomicU64::new(0),
         large_alloc_count: AtomicU64::new(0),
         large_alloc_bytes: AtomicU64::new(0),
+        large_dealloc_bytes: AtomicU64::new(0),
     };
 
     #[inline(always)]
@@ -104,6 +107,7 @@ impl HeapMetrics {
     #[inline(always)]
     pub fn on_large_dealloc(&self, size: usize) {
         inc(&self.free_bytes, size as u64);
+        inc(&self.large_dealloc_bytes, size as u64);
     }
 
     #[inline(always)]
@@ -119,6 +123,7 @@ impl HeapMetrics {
         *self.remote_free_count.get_mut() += other.remote_free_count.load(R);
         *self.large_alloc_count.get_mut() += other.large_alloc_count.load(R);
         *self.large_alloc_bytes.get_mut() += other.large_alloc_bytes.load(R);
+        *self.large_dealloc_bytes.get_mut() += other.large_dealloc_bytes.load(R);
         for i in 0..NUM_CLASSES {
             *self.class_alloc_count[i].get_mut() += other.class_alloc_count[i].load(R);
             *self.class_dealloc_count[i].get_mut() += other.class_dealloc_count[i].load(R);
@@ -223,6 +228,7 @@ impl PoolMetrics {
 // r[impl metrics.class-live] r[impl metrics.class-slab-count]
 pub struct MetricsSnapshot {
     pub allocated: u64,
+    pub active: u64,
     pub mapped: u64,
 
     pub alloc_bytes: u64,
@@ -246,6 +252,7 @@ pub struct MetricsSnapshot {
 
     pub large_alloc_count: u64,
     pub large_alloc_bytes: u64,
+    pub large_dealloc_bytes: u64,
 
     pub remote_free_count: u64,
 
@@ -256,6 +263,7 @@ impl MetricsSnapshot {
     pub(crate) fn new() -> Self {
         Self {
             allocated: 0,
+            active: 0,
             mapped: 0,
             alloc_bytes: 0,
             free_bytes: 0,
@@ -273,6 +281,7 @@ impl MetricsSnapshot {
             segment_munmap_count: 0,
             large_alloc_count: 0,
             large_alloc_bytes: 0,
+            large_dealloc_bytes: 0,
             remote_free_count: 0,
             pool_lock_count: 0,
         }
@@ -284,6 +293,7 @@ impl MetricsSnapshot {
         self.remote_free_count += h.remote_free_count.load(R);
         self.large_alloc_count += h.large_alloc_count.load(R);
         self.large_alloc_bytes += h.large_alloc_bytes.load(R);
+        self.large_dealloc_bytes += h.large_dealloc_bytes.load(R);
         for i in 0..NUM_CLASSES {
             self.class_alloc_count[i] += h.class_alloc_count[i].load(R);
             self.class_dealloc_count[i] += h.class_dealloc_count[i].load(R);

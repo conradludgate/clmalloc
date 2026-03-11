@@ -10,7 +10,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 clmalloc = []
 metrics = []
 pprof = ["dep:backtrace", "dep:flate2", "dep:rand"]
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 mimalloc = ["dep:mimalloc"]
 snmalloc = ["dep:snmalloc-rs"]
 
@@ -22,6 +22,7 @@ rand = { version = "0.10", optional = true, default-features = false, features =
 mimalloc = { version = "0.1.48", optional = true }
 snmalloc-rs = { version = "0.3.8", optional = true }
 spin = { version = "0.10", default-features = false, features = ["spin_mutex", "once"] }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
 tikv-jemallocator = { version = "0.6.1", optional = true }
 
 [[bench]]
@@ -34,6 +35,10 @@ harness = false
 
 [[bench]]
 name = "tokio_worksteal"
+harness = false
+
+[[bench]]
+name = "fragmentation"
 harness = false
 
 [dev-dependencies]

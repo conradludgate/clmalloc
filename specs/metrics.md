@@ -36,14 +36,16 @@ minus free across all heaps). Corresponds to jemalloc `stats.allocated`.
 
 r[metrics.global-active]
 The global snapshot MUST include total active bytes: the bytes in
-slab pages that contain at least one outstanding allocation. This
-includes internal fragmentation (unused slots in active slabs).
+slab pages that contain at least one outstanding allocation, plus
+the live large-allocation footprint. Computed as
+`outstanding_slabs * SLAB_SIZE + (large_alloc_bytes - large_dealloc_bytes)`.
 `active >= allocated`. Corresponds to jemalloc `stats.active`.
 
 r[metrics.global-mapped]
 The global snapshot MUST include total mapped bytes: the sum of all
 virtual address space obtained from the OS via mmap (or equivalent)
-and not yet returned via munmap. Corresponds to jemalloc `stats.mapped`.
+and not yet returned via munmap. This MUST include both segment
+memory and large allocations. Corresponds to jemalloc `stats.mapped`.
 
 r[metrics.global-resident]
 The global snapshot MUST include total resident bytes: the portion
@@ -152,6 +154,11 @@ r[metrics.large-alloc-bytes]
 Each thread-local heap MUST maintain cumulative bytes for large
 allocations. These go directly to mmap and are significantly more
 expensive than slab-served allocations.
+
+r[metrics.large-dealloc-bytes]
+Each thread-local heap MUST maintain cumulative bytes for large
+deallocations. Combined with `large-alloc-bytes`, this yields the
+live large-allocation footprint needed for the `active` gauge.
 
 ## Remote free tracking
 
