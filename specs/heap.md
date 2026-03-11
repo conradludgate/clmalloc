@@ -51,7 +51,7 @@ MUST remain valid (they will be freed via remote free lists by other threads).
 
 r[heap.abandon]
 When a thread exits with slabs that still have outstanding allocations, those
-slabs MUST be placed on a global abandoned-slab list. Other heaps SHOULD adopt
+slabs MUST be placed on a global abandoned-slab list. Other heaps MUST adopt
 abandoned slabs for the same size class before requesting a fresh slab from
 the page pool. Once all slots in an abandoned slab are freed, it MUST be
 returned to the page pool.

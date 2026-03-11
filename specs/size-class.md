@@ -21,12 +21,12 @@ that alignment.
 ## Class definitions
 
 r[size-class.small]
-Size classes from 8 bytes up to 1024 bytes SHOULD use a spacing that wastes
+Size classes from 8 bytes up to 1024 bytes MUST use a spacing that wastes
 at most 25% per allocation (e.g. powers of 2 with 4 intermediate steps,
 giving a 1.25x growth factor).
 
 r[size-class.medium]
-Size classes from 1024 bytes up to 32768 bytes SHOULD use a spacing that
+Size classes from 1024 bytes up to 32768 bytes MUST use a spacing that
 wastes at most 25% per allocation.
 
 r[size-class.large]

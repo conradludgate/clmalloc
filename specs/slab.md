@@ -56,5 +56,5 @@ New slabs MUST be obtained from a global page pool backed by OS memory
 
 r[slab.return-to-pool]
 When all slots in a slab are free (local + remote lists account for every
-slot), the slab SHOULD be returned to the global page pool for reuse by
+slot), the slab MUST be returned to the global page pool for reuse by
 any thread.

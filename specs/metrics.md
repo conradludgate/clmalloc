@@ -37,14 +37,14 @@ active bytes).
 ## Per-size-class stats
 
 r[metrics.class-alloc-count]
-Each thread-local heap SHOULD maintain a per-size-class allocation count.
+Each thread-local heap MUST maintain a per-size-class allocation count.
 
 r[metrics.class-slab-count]
-The global snapshot SHOULD include the number of active slabs per size class.
+The global snapshot MUST include the number of active slabs per size class.
 
 ## Remote free tracking
 
 r[metrics.remote-free-count]
-Each thread-local heap SHOULD maintain a count of remote frees received
+Each thread-local heap MUST maintain a count of remote frees received
 (drains from the remote free list). This indicates cross-thread traffic
 and is useful for diagnosing work-stealing allocation patterns.

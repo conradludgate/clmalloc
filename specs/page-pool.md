@@ -10,7 +10,7 @@ The page pool MUST provide slabs of the requested size, properly aligned
 to the slab size boundary (for pointer masking).
 
 r[pool.thread-safe]
-The page pool MUST be safe to access from any thread. It SHOULD use a
+The page pool MUST be safe to access from any thread. It MUST use a
 low-contention lock (e.g. spin lock). Lock-free pop from a shared slab
 cache is not viable due to data races on intrusive next-pointers; this
 is consistent with jemalloc, tcmalloc, and mimalloc which all use locks
@@ -24,8 +24,22 @@ allocator trait. The production implementation MUST use mmap (or platform
 equivalent) with MAP_ANONYMOUS | MAP_PRIVATE.
 
 r[pool.batch-mmap]
-The page pool SHOULD request memory from the OS in large batches (e.g.
+The page pool MUST request memory from the OS in large batches (e.g.
 2 MiB or more) and carve slabs from the batch, to amortize syscall cost.
+
+r[pool.no-syscall-under-lock]
+The page pool MUST NOT perform OS memory allocation (mmap) while holding
+the pool lock. The lock MUST be released before the syscall and
+re-acquired after, so that other threads can pop from the free list
+without blocking on a ~10μs mmap.
+
+## Memory return
+
+r[pool.purge]
+When a segment has all of its slabs on the free list, the page pool MUST
+return the physical pages to the OS (e.g. via `madvise(MADV_DONTNEED)` or
+`munmap`). This ensures that long-running processes release memory when
+usage drops.
 
 ## Exhaustion
 
