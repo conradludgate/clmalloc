@@ -238,6 +238,7 @@ impl Slab {
 
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
     /// Pop a slot from the local free list. O(1).
+    #[inline]
     pub fn alloc(&mut self) -> Option<NonNull<u8>> {
         self.header().local.with_mut(|p| {
             let local = unsafe { &mut *p };
@@ -253,6 +254,7 @@ impl Slab {
 
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
     /// Return a slot to the local free list. O(1).
+    #[inline]
     pub fn dealloc_local(&mut self, ptr: NonNull<u8>) {
         self.header().local.with_mut(|p| {
             let local = unsafe { &mut *p };
@@ -317,6 +319,7 @@ impl SlabRef {
     ///
     /// # Safety
     /// `ptr` must point within a live, initialized slab.
+    #[inline]
     pub unsafe fn from_interior_ptr(ptr: *const u8) -> SlabRef {
         SlabRef {
             header: unsafe { SlabHeader::from_ptr(ptr) },
@@ -325,11 +328,13 @@ impl SlabRef {
 
     /// Heap that owns this slab. Immutable after the heap sets it, so safe
     /// to read from any thread without synchronization.
+    #[inline]
     pub fn heap_id(&self) -> usize {
         self.header().heap_id
     }
 
     /// True if two `SlabRef`s point to the same slab header.
+    #[inline]
     pub fn header_eq(&self, other: &SlabRef) -> bool {
         self.header == other.header
     }

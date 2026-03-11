@@ -50,6 +50,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     }
 
     // r[impl heap.alloc-fast-path] r[impl heap.slab-request]
+    #[inline]
     pub fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         let idx = match size_class::class_index(layout) {
             Some(idx) => idx,
@@ -76,6 +77,8 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         self.request_slab(idx)
     }
 
+    #[cold]
+    #[inline(never)]
     fn request_slab(&mut self, class_idx: usize) -> Option<NonNull<u8>> {
         if let Some(ptr) = self.try_adopt(class_idx) {
             return Some(ptr);
@@ -87,6 +90,8 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         ptr
     }
 
+    #[cold]
+    #[inline(never)]
     // r[impl heap.abandon]
     fn try_adopt(&mut self, class_idx: usize) -> Option<NonNull<u8>> {
         // Drain the abandoned list: return fully-free slabs to the pool,
@@ -111,6 +116,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     }
 
     // r[impl heap.alloc-fast-path]
+    #[inline]
     /// # Safety
     /// - `ptr` must have been returned by `alloc` on some `Heap` sharing the
     ///   same `PagePool`.
@@ -164,6 +170,8 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     /// - Fully free → return to pool and unlink.
     /// - Has free slots → unlink and promote to active bin.
     /// - Still full → leave in list.
+    #[cold]
+    #[inline(never)]
     fn promote_retired(&mut self, class_idx: usize) {
         let mut prev: *mut Option<NonNull<SlabBase>> = &mut self.retired_heads[class_idx];
         while let Some(base) = unsafe { *prev } {
@@ -186,6 +194,8 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     }
 
     /// Move the exhausted active slab to the retired linked list for its class.
+    #[cold]
+    #[inline(never)]
     fn retire_active(&mut self, class_idx: usize) {
         if let Some(mut slab) = self.bins[class_idx].take() {
             slab.set_next_abandoned(self.retired_heads[class_idx]);
@@ -195,6 +205,8 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
 
     /// Retire the active slab during thread exit. Fully-free slabs go back
     /// to the pool; partially-used slabs are abandoned for adoption.
+    #[cold]
+    #[inline(never)]
     fn retire_slab(&mut self, class_idx: usize) {
         if let Some(mut slab) = self.bins[class_idx].take() {
             slab.drain_remote();

@@ -67,6 +67,7 @@ impl<P: PageAllocator> PagePool<P> {
     /// Fast path: pop from the free list.
     /// Slow path: carve from the current segment.
     /// Slowest path: allocate a new segment from the page allocator.
+    #[cold]
     pub fn alloc_slab(&self) -> Option<NonNull<SlabBase>> {
         let mut state = self.state.lock();
 
@@ -101,6 +102,7 @@ impl<P: PageAllocator> PagePool<P> {
     ///
     /// The first pointer-sized bytes of the slab's memory are used as the
     /// free list next-pointer (the slab is fully free, so its memory is unused).
+    #[cold]
     pub fn dealloc_slab(&self, base: NonNull<SlabBase>) {
         let mut state = self.state.lock();
         let slab: Link = base.as_ptr().cast();
@@ -112,6 +114,7 @@ impl<P: PageAllocator> PagePool<P> {
     ///
     /// Called during thread exit when a slab still has outstanding allocations.
     /// Another heap can later adopt it via `adopt_slab`.
+    #[cold]
     pub fn abandon_slab(&self, mut slab: Slab) {
         let class_idx = slab.size_class_index();
         let mut state = self.state.lock();
@@ -123,6 +126,7 @@ impl<P: PageAllocator> PagePool<P> {
     ///
     /// Returns the slab with ownership transferred to the caller.
     /// The caller must `drain_remote` and `set_heap_id` before use.
+    #[cold]
     pub fn adopt_slab(&self, class_idx: usize) -> Option<Slab> {
         let mut state = self.state.lock();
         let head = state.abandoned_heads[class_idx]?;
@@ -136,6 +140,7 @@ impl<P: PageAllocator> PagePool<P> {
     /// Allocate memory for a request exceeding the max size class.
     ///
     /// Delegates directly to the page allocator; no pooling.
+    #[cold]
     pub fn alloc_large(&self, layout: Layout) -> Option<NonNull<u8>> {
         self.page_alloc.alloc(layout)
     }
@@ -145,6 +150,7 @@ impl<P: PageAllocator> PagePool<P> {
     ///
     /// # Safety
     /// `ptr` must have been returned by `alloc_large` with the same `layout`.
+    #[cold]
     pub unsafe fn dealloc_large(&self, ptr: NonNull<u8>, layout: Layout) {
         unsafe { self.page_alloc.dealloc(ptr, layout) };
     }

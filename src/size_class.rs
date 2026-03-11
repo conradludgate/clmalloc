@@ -20,6 +20,7 @@ pub const NUM_CLASSES: usize = NUM_REGULAR + 1;
 ///
 /// O(1) via bit arithmetic. Rounds size up to the next multiple of `align`,
 /// then finds the smallest size class that fits.
+#[inline]
 pub fn class_index(layout: Layout) -> Option<usize> {
     let size = layout.size().next_multiple_of(layout.align()).max(MIN_SIZE);
 
