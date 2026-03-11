@@ -103,6 +103,71 @@ impl SlotFreeList {
     }
 }
 
+/// Lock-free stack for cross-thread slot deallocation (Treiber stack).
+///
+/// Any thread can `push`; only the owning thread calls `swap_drain`.
+/// Links are stored in the slot memory itself via `write_next`.
+pub(crate) struct TreiberStack {
+    head: AtomicPtr<u8>,
+}
+
+impl TreiberStack {
+    pub const fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(null_mut()),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Relaxed).is_null()
+    }
+
+    // r[impl slab.remote-freelist]
+    /// Push a single slot via CAS loop.
+    pub fn push(&self, slot: NonNull<u8>) {
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: slot was allocated from a slab; has space for link.
+            unsafe { write_next(slot, head) };
+            match self.head.compare_exchange_weak(
+                head,
+                slot.as_ptr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => head = actual,
+            }
+        }
+    }
+
+    /// Push a pre-chained list `[first -> ... -> last]` in a single CAS.
+    pub fn push_chain(&self, first: NonNull<u8>, last: NonNull<u8>) {
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: last was allocated from a slab; has space for link.
+            unsafe { write_next(last, head) };
+            match self.head.compare_exchange_weak(
+                head,
+                first.as_ptr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => head = actual,
+            }
+        }
+    }
+
+    // r[impl slab.remote-drain]
+    /// Atomically take the entire chain. Returns the raw head (null if empty).
+    /// The caller walks the chain via `read_next`.
+    pub fn swap_drain(&self) -> Link {
+        self.head.swap(null_mut(), Ordering::Acquire)
+    }
+}
+
 // r[impl slab.alignment] r[impl slab.single-class] r[impl slab.metadata] r[impl slab.owner]
 #[repr(C)]
 struct SlabHeader {
@@ -122,7 +187,7 @@ struct SlabHeader {
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
     local: UnsafeCell<SlotFreeList>,
     // r[impl slab.remote-freelist]
-    remote_head: AtomicPtr<u8>,
+    remote: TreiberStack,
 }
 
 impl SlabHeader {
@@ -152,7 +217,7 @@ impl SlabHeader {
                     bump_cursor: slots_offset as u16,
                     bump_remaining: slot_count as u16,
                     local: UnsafeCell::new(SlotFreeList::EMPTY),
-                    remote_head: AtomicPtr::new(null_mut()),
+                    remote: TreiberStack::new(),
                 },
             );
             NonNull::new_unchecked(header)
@@ -325,7 +390,7 @@ impl Slab {
     /// True if the remote free list has pending entries. Cheaper than
     /// `drain_remote` when we only need to know whether draining is worthwhile.
     pub fn has_pending_remote(&self) -> bool {
-        !self.header().remote_head.load(Ordering::Relaxed).is_null()
+        !self.header().remote.is_empty()
     }
 
     // r[impl slab.remote-drain]
@@ -335,7 +400,7 @@ impl Slab {
     /// node to the local list. Returns the number of slots recovered.
     pub fn drain_remote(&mut self) -> u16 {
         let header = self.header();
-        let chain = header.remote_head.swap(null_mut(), Ordering::Acquire);
+        let chain = header.remote.swap_drain();
         header.local.with_mut(|p| {
             // SAFETY: with_mut provides exclusive access to SlotFreeList.
             let free_list = unsafe { &mut *p };
@@ -420,45 +485,15 @@ impl SlabRef {
 
     // r[impl slab.remote-freelist]
     /// Push a freed slot onto the remote free list via atomic CAS.
-    ///
-    /// O(1) amortized (CAS retry loop).
     pub fn dealloc_remote(&self, ptr: NonNull<u8>) {
-        let header = self.header();
-        let mut head = header.remote_head.load(Ordering::Relaxed);
-        loop {
-            // SAFETY: ptr was allocated from this slab; slot has space for link.
-            unsafe { write_next(ptr, head) };
-            match header.remote_head.compare_exchange_weak(
-                head,
-                ptr.as_ptr(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => head = actual,
-            }
-        }
+        self.header().remote.push(ptr);
     }
 
     /// Push a pre-chained list `[first -> ... -> last]` onto the remote
     /// free list in a single CAS. Used by the free cache flush to batch
     /// multiple frees into one atomic operation per slab.
     pub fn push_chain_remote(&self, first: NonNull<u8>, last: NonNull<u8>) {
-        let header = self.header();
-        let mut head = header.remote_head.load(Ordering::Relaxed);
-        loop {
-            // SAFETY: last was allocated from this slab; slot has space for link.
-            unsafe { write_next(last, head) };
-            match header.remote_head.compare_exchange_weak(
-                head,
-                first.as_ptr(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => head = actual,
-            }
-        }
+        self.header().remote.push_chain(first, last);
     }
 }
 
