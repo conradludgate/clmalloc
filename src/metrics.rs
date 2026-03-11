@@ -369,7 +369,6 @@ mod tests {
         assert_eq!(m.class_free_bytes[idx].load(R), 128);
     }
 
-    // r[verify metrics.thread-active-bytes]
     #[test]
     fn accumulate_folds_counters() {
         let mut a = HeapMetrics::ZERO;

@@ -541,7 +541,6 @@ mod tests {
         set_prof_active(false);
     }
 
-    // r[verify pprof.dump-format]
     #[test]
     fn dump_produces_valid_gzip() {
         set_prof_active(true);

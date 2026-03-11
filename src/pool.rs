@@ -563,8 +563,6 @@ mod tests {
         assert_eq!(pool.segment_count(), 1);
     }
 
-    // r[verify pool.no-syscall-under-lock]
-    // Exercises the race path where multiple threads mmap concurrently.
     // r[verify pool.thread-safe]
     #[test]
     fn concurrent_alloc_dealloc() {

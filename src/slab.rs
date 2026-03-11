@@ -646,7 +646,6 @@ mod tests {
         assert_eq!(t.slab.slot_size(), size_class::class_size(5));
     }
 
-    // r[verify slab.owner]
     #[test]
     fn slab_is_send_not_sync() {
         fn assert_send<T: Send>() {}
@@ -760,7 +759,6 @@ mod tests {
         assert_eq!(recovered, originals);
     }
 
-    // r[verify slab.return-to-pool]
     #[test]
     fn fully_free_lifecycle() {
         let mut t = TestSlab::new(0);

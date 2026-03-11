@@ -630,7 +630,6 @@ mod tests {
         }
     }
 
-    // r[verify heap.alloc-fast-path]
     #[test]
     fn large_allocation_passthrough() {
         let pool = pool();
