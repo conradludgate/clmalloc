@@ -1,0 +1,13 @@
+specs (
+  {
+    name clmalloc
+    include (specs/*.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+        test_include (tests/**/*.rs src/**/*.rs)
+      }
+    )
+  }
+)
