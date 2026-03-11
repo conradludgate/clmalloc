@@ -63,9 +63,44 @@ pub(crate) unsafe fn write_next(slot: NonNull<u8>, next: Link) {
     unsafe { slot.as_ptr().cast::<Link>().write_unaligned(next) };
 }
 
-struct LocalState {
+/// Intrusive singly-linked free list for slab slots.
+///
+/// Each free slot stores a next-pointer in its first pointer-sized bytes
+/// (unaligned, since some size classes aren't pointer-aligned). Unsafe
+/// is confined to `push`/`pop` which call `read_next`/`write_next`.
+pub(crate) struct SlotFreeList {
     head: Link,
-    free_count: u16,
+    len: u16,
+}
+
+impl SlotFreeList {
+    pub const EMPTY: Self = Self {
+        head: null_mut(),
+        len: 0,
+    };
+
+    #[inline]
+    pub fn pop(&mut self) -> Option<NonNull<u8>> {
+        let head = NonNull::new(self.head)?;
+        // SAFETY: head is from our free list, pointing to a valid slot
+        // with at least pointer-sized bytes for the link.
+        self.head = unsafe { read_next(head) };
+        self.len -= 1;
+        Some(head)
+    }
+
+    #[inline]
+    pub fn push(&mut self, slot: NonNull<u8>) {
+        // SAFETY: slot was allocated from a slab; has space for link.
+        unsafe { write_next(slot, self.head) };
+        self.head = slot.as_ptr();
+        self.len += 1;
+    }
+
+    #[inline]
+    pub fn len(&self) -> u16 {
+        self.len
+    }
 }
 
 // r[impl slab.alignment] r[impl slab.single-class] r[impl slab.metadata] r[impl slab.owner]
@@ -85,7 +120,7 @@ struct SlabHeader {
     bump_cursor: u16,
     bump_remaining: u16,
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
-    local: UnsafeCell<LocalState>,
+    local: UnsafeCell<SlotFreeList>,
     // r[impl slab.remote-freelist]
     remote_head: AtomicPtr<u8>,
 }
@@ -116,10 +151,7 @@ impl SlabHeader {
                     next_link: None,
                     bump_cursor: slots_offset as u16,
                     bump_remaining: slot_count as u16,
-                    local: UnsafeCell::new(LocalState {
-                        head: null_mut(),
-                        free_count: slot_count as u16,
-                    }),
+                    local: UnsafeCell::new(SlotFreeList::EMPTY),
                     remote_head: AtomicPtr::new(null_mut()),
                 },
             );
@@ -234,15 +266,16 @@ impl Slab {
         self.header().size_class_index as usize
     }
 
-    /// Free slots on the local list. Does not include remotely freed slots —
-    /// call `drain_remote` first for a complete count.
+    /// Available slots (free list + uncarved bump region). Does not include
+    /// remotely freed slots — call `drain_remote` first for a complete count.
     pub fn free_count(&self) -> u16 {
-        // SAFETY: with_mut provides exclusive access to LocalState.
-        self.header().local.with_mut(|p| unsafe { (*p).free_count })
+        let header = self.header();
+        // SAFETY: with_mut provides exclusive access to SlotFreeList.
+        header.local.with_mut(|p| unsafe { (*p).len }) + header.bump_remaining
     }
 
     // r[impl slab.return-to-pool]
-    /// True when every slot is on the local free list.
+    /// True when every slot is available (none outstanding).
     /// Call `drain_remote` first to account for remotely freed slots.
     pub fn is_fully_free(&self) -> bool {
         self.free_count() == self.header().slot_count
@@ -258,13 +291,8 @@ impl Slab {
 
         // Fast path: pop from the local free list (recycled slots).
         let ptr = header.local.with_mut(|p| {
-            // SAFETY: with_mut provides exclusive access to LocalState.
-            let local = unsafe { &mut *p };
-            let head = NonNull::new(local.head)?;
-            // SAFETY: head is from our free list, so it points to a valid slot.
-            local.head = unsafe { read_next(head) };
-            local.free_count -= 1;
-            Some(head)
+            // SAFETY: with_mut provides exclusive access to SlotFreeList.
+            unsafe { &mut *p }.pop()
         });
         if ptr.is_some() {
             return ptr;
@@ -277,8 +305,6 @@ impl Slab {
             let slot = unsafe { base.add(header.bump_cursor as usize) };
             header.bump_cursor = header.bump_cursor.wrapping_add(header.slot_size);
             header.bump_remaining -= 1;
-            // SAFETY: with_mut provides exclusive access to LocalState.
-            header.local.with_mut(|p| unsafe { (*p).free_count -= 1 });
             // SAFETY: slot is within the slab's bump region, non-null.
             return Some(unsafe { NonNull::new_unchecked(slot) });
         }
@@ -291,12 +317,8 @@ impl Slab {
     #[inline]
     pub fn dealloc_local(&mut self, ptr: NonNull<u8>) {
         self.header().local.with_mut(|p| {
-            // SAFETY: with_mut provides exclusive access to LocalState.
-            let local = unsafe { &mut *p };
-            // SAFETY: ptr was allocated from this slab; slot has space for link.
-            unsafe { write_next(ptr, local.head) };
-            local.head = ptr.as_ptr();
-            local.free_count += 1;
+            // SAFETY: with_mut provides exclusive access to SlotFreeList.
+            unsafe { &mut *p }.push(ptr);
         });
     }
 
@@ -315,17 +337,15 @@ impl Slab {
         let header = self.header();
         let chain = header.remote_head.swap(null_mut(), Ordering::Acquire);
         header.local.with_mut(|p| {
-            // SAFETY: with_mut provides exclusive access to LocalState.
-            let local = unsafe { &mut *p };
+            // SAFETY: with_mut provides exclusive access to SlotFreeList.
+            let free_list = unsafe { &mut *p };
             let mut count = 0u16;
             let mut cursor = chain;
             while let Some(slot) = NonNull::new(cursor) {
                 // SAFETY: slot is from remote list, valid allocated slot.
+                // Read next before push overwrites the link.
                 let next = unsafe { read_next(slot) };
-                // SAFETY: slot is from remote list, valid allocated slot.
-                unsafe { write_next(slot, local.head) };
-                local.head = cursor;
-                local.free_count += 1;
+                free_list.push(slot);
                 count += 1;
                 cursor = next;
             }
