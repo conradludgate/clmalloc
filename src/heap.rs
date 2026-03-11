@@ -305,6 +305,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
 
         if self.caches[idx].is_full() {
             self.flush_cache(idx);
+            self.collect_full_list(idx);
         }
         self.caches[idx].push(ptr);
     }
@@ -374,6 +375,29 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
                 } else {
                     slab_list_push(&mut self.partial_heads[class_idx], slab);
                 }
+                continue;
+            }
+            cursor.advance(&mut slab);
+        }
+    }
+
+    /// Walk the full list after a cache flush, returning fully-free slabs
+    /// to the pool. Unlike `scan_full_list`, this runs on the dealloc path
+    /// and does not promote partial slabs — it only reclaims empty ones.
+    #[cold]
+    #[inline(never)]
+    fn collect_full_list(&mut self, class_idx: usize) {
+        // SAFETY: pointer to full_heads element; no aliasing access during iteration.
+        let mut cursor = unsafe { SlabListCursor::new(&raw mut self.full_heads[class_idx]) };
+        while let Some(base) = cursor.current() {
+            // SAFETY: base came from our full list; slab is valid.
+            let mut slab = unsafe { Slab::from_raw(base) };
+            if slab.has_pending_remote() {
+                slab.drain_remote();
+            }
+            if slab.is_fully_free() {
+                cursor.remove_current(&slab);
+                self.pool.dealloc_slab(slab.into_raw());
                 continue;
             }
             cursor.advance(&mut slab);
@@ -1109,15 +1133,45 @@ mod tests {
     #[cfg(feature = "metrics")]
     #[test]
     fn metrics_pool_counters() {
+        use crate::pool::{PURGE_HIGH_WATER, SEGMENT_SIZE};
+        use crate::slab::SLAB_SIZE;
         let pool = pool();
+        let slabs_per_seg = SEGMENT_SIZE / SLAB_SIZE;
 
-        // Alloc and free a slab directly to exercise pool-level metrics.
-        let slab = pool.alloc_slab().unwrap();
-        pool.dealloc_slab(slab);
+        // Allocate enough slabs across multiple segments, keeping one per
+        // segment alive so full-segment munmap never fires.
+        let num_segments = (PURGE_HIGH_WATER / slabs_per_seg) + 2;
+        let total = num_segments * slabs_per_seg;
+        let mut slabs = Vec::new();
+        for _ in 0..total {
+            slabs.push(pool.alloc_slab().unwrap());
+        }
+
+        let mut anchors = Vec::new();
+        let mut to_free = Vec::new();
+        for (i, slab) in slabs.into_iter().enumerate() {
+            if i % slabs_per_seg == 0 {
+                anchors.push(slab);
+            } else {
+                to_free.push(slab);
+            }
+        }
+
+        for slab in &to_free {
+            pool.dealloc_slab(*slab);
+        }
 
         let snap = pool.snapshot();
         assert!(snap.pool_lock_count > 0);
         assert!(snap.segment_mmap_count > 0);
         assert!(snap.slab_purge_count > 0);
+
+        for slab in to_free {
+            // Already freed above; just need to clean up anchors.
+            let _ = slab;
+        }
+        for slab in anchors {
+            pool.dealloc_slab(slab);
+        }
     }
 }

@@ -1,12 +1,13 @@
 //! Global page pool: manages OS memory and distributes slabs to heaps.
 //!
-//! All pool state (free slab list + segment carving) is protected by a
+//! All pool state (free slab lists + segment carving) is protected by a
 //! single `spin::Mutex`. This is a cold path — accessed only when a heap
 //! needs a new slab or returns one — so lock-free complexity is unnecessary.
 //!
-//! The pool releases physical pages back to the OS when an entire segment's
-//! slabs are returned (purge). Segment allocation (mmap) is performed
-//! outside the lock to avoid blocking other threads on syscall latency.
+//! Returned slabs go onto a **dirty list** (pages still resident). When the
+//! dirty count exceeds a high-water mark, excess slabs are purged in batch
+//! (outside the lock) and moved to a **clean list**. Allocation prefers
+//! dirty slabs (no page fault on reuse), then clean, then carving/mmap.
 
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
@@ -19,6 +20,9 @@ use crate::sys::PageAllocator;
 pub(crate) const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const MAX_SEGMENTS: usize = 4096;
 const SLABS_PER_SEGMENT: usize = SEGMENT_SIZE / SLAB_SIZE;
+
+pub(crate) const PURGE_HIGH_WATER: usize = 64; // 4 MiB of dirty slabs triggers purge
+const PURGE_LOW_WATER: usize = 32; // purge down to 2 MiB
 
 #[repr(C, align(65536))]
 struct SlabPage([u8; SLAB_SIZE]);
@@ -35,26 +39,27 @@ type Link = *mut SlabPage;
 /// first pointer-sized bytes (always aligned since `SlabPage` is 64KB-aligned).
 struct PageFreeList {
     head: Link,
+    len: usize,
 }
 
 impl PageFreeList {
-    const EMPTY: Self = Self { head: null_mut() };
-
-    #[expect(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.head.is_null()
-    }
+    const EMPTY: Self = Self {
+        head: null_mut(),
+        len: 0,
+    };
 
     fn push(&mut self, slab: Link) {
         // SAFETY: slab is a valid SLAB_SIZE-aligned page; first word holds the link.
         unsafe { slab.cast::<Link>().write(self.head) };
         self.head = slab;
+        self.len += 1;
     }
 
     fn pop(&mut self) -> Option<NonNull<SlabPage>> {
         let slab = NonNull::new(self.head)?;
         // SAFETY: slab is from our free list; first word holds the next link.
         self.head = unsafe { slab.as_ptr().cast::<Link>().read() };
+        self.len -= 1;
         Some(slab)
     }
 
@@ -67,6 +72,7 @@ impl PageFreeList {
                 let slab = *cursor;
                 if pred(slab) {
                     *cursor = slab.cast::<Link>().read();
+                    self.len -= 1;
                 } else {
                     cursor = slab.cast::<Link>();
                 }
@@ -76,7 +82,8 @@ impl PageFreeList {
 }
 
 struct PoolState {
-    free_list: PageFreeList,
+    dirty_list: PageFreeList,
+    clean_list: PageFreeList,
     abandoned_heads: [SlabList; NUM_CLASSES],
     segment_cursor: Link,
     segment_end: Link,
@@ -115,7 +122,8 @@ impl<P: PageAllocator> PagePool<P> {
         Self {
             page_alloc,
             state: spin::Mutex::new(PoolState {
-                free_list: PageFreeList::EMPTY,
+                dirty_list: PageFreeList::EMPTY,
+                clean_list: PageFreeList::EMPTY,
                 abandoned_heads: [None; NUM_CLASSES],
                 segment_cursor: null_mut::<SlabPage>(),
                 segment_end: null_mut::<SlabPage>(),
@@ -147,7 +155,8 @@ impl<P: PageAllocator> PagePool<P> {
             state.metrics.pool_lock_count += 1;
         }
 
-        if let Some(slab) = state.free_list.pop() {
+        // r[impl pool.dirty-reuse]
+        if let Some(slab) = state.dirty_list.pop().or_else(|| state.clean_list.pop()) {
             let seg = Self::find_segment(&state, slab.as_ptr() as usize);
             state.seg_outstanding[seg] += 1;
             #[cfg(feature = "metrics")]
@@ -206,12 +215,12 @@ impl<P: PageAllocator> PagePool<P> {
 
         if state.segment_cursor < state.segment_end {
             // Another thread set up a carving segment while we were in mmap.
-            // Push remaining slabs to the free list so they aren't lost.
+            // Push remaining slabs to the clean list (freshly mmap'd = zeroed).
             let seg_base: Link = base.as_ptr().cast();
             for i in (1..SLABS_PER_SEGMENT).rev() {
                 // SAFETY: i in 1..SLABS_PER_SEGMENT, segment has SLABS_PER_SEGMENT slabs.
                 let slab = unsafe { seg_base.add(i) };
-                state.free_list.push(slab);
+                state.clean_list.push(slab);
             }
         } else {
             state.carving_idx = seg_idx;
@@ -229,29 +238,22 @@ impl<P: PageAllocator> PagePool<P> {
 
     /// Return a fully-free slab to the pool for reuse.
     ///
+    /// The slab is placed on the dirty list without purging. When the dirty
+    /// count exceeds `PURGE_HIGH_WATER`, excess slabs are purged in batch
+    /// outside the lock and moved to the clean list.
+    ///
     /// When the last outstanding slab of a segment is returned, the entire
-    /// segment is released back to the OS via munmap. Otherwise, the slab's
-    /// physical pages are released via `madvise` so the OS can reclaim them
-    /// while keeping the virtual address range available for reuse.
-    // r[impl pool.purge] r[impl pool.purge-free-slab] r[impl pool.purge-before-publish]
+    /// segment is released back to the OS via munmap.
+    // r[impl pool.purge-free-slab] r[impl pool.deferred-purge]
     #[cold]
     pub fn dealloc_slab(&self, base: NonNull<SlabBase>) {
-        // Purge before making the slab available on the free list.
-        // Another thread could otherwise pop this slab and reinitialize
-        // it before we finish purging, zeroing the new header.
-        // SAFETY: base points to a SLAB_SIZE-aligned, SLAB_SIZE-byte region
-        // within a live mmap'd segment. The slab is fully free; no other
-        // thread can access it since it is not yet on any shared list.
-        unsafe { self.page_alloc.purge(base.cast(), SLAB_SIZE) };
-
         let slab: Link = base.as_ptr().cast();
         let mut state = self.state.lock();
         #[cfg(feature = "metrics")]
         {
             state.metrics.pool_lock_count += 1;
-            state.metrics.slab_purge_count += 1;
         }
-        state.free_list.push(slab);
+        state.dirty_list.push(slab);
 
         let seg = Self::find_segment(&state, slab as usize);
         state.seg_outstanding[seg] -= 1;
@@ -276,6 +278,71 @@ impl<P: PageAllocator> PagePool<P> {
                     Layout::new::<Segment>(),
                 );
             }
+            return;
+        }
+
+        let should_purge = state.dirty_list.len > PURGE_HIGH_WATER;
+        drop(state);
+        if should_purge {
+            self.purge_excess();
+        }
+    }
+
+    /// Purge dirty slabs down to `PURGE_LOW_WATER`. Slabs are popped into
+    /// a stack-local buffer, the lock is released, each slab is purged via
+    /// madvise, then the lock is re-acquired and purged slabs are moved to
+    /// the clean list.
+    ///
+    /// While slabs are in the local buffer (off all shared lists), they are
+    /// counted as outstanding so that segment munmap cannot fire underneath
+    /// them.
+    // r[impl pool.deferred-purge] r[impl pool.purge-not-on-shared-list]
+    #[cold]
+    #[inline(never)]
+    fn purge_excess(&self) {
+        const BATCH: usize = PURGE_HIGH_WATER - PURGE_LOW_WATER;
+        let mut buf: [Link; BATCH] = [null_mut(); BATCH];
+        let mut count = 0;
+
+        {
+            let mut state = self.state.lock();
+            #[cfg(feature = "metrics")]
+            {
+                state.metrics.pool_lock_count += 1;
+            }
+            while state.dirty_list.len > PURGE_LOW_WATER && count < BATCH {
+                if let Some(slab) = state.dirty_list.pop() {
+                    let ptr = slab.as_ptr();
+                    // Keep the slab counted as outstanding while it's in our
+                    // local buffer, preventing segment munmap from firing.
+                    let seg = Self::find_segment(&state, ptr as usize);
+                    state.seg_outstanding[seg] += 1;
+                    buf[count] = ptr;
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for slab in &buf[..count] {
+            // SAFETY: slab is a valid SLAB_SIZE-aligned page not on any shared list.
+            unsafe {
+                self.page_alloc
+                    .purge(NonNull::new_unchecked((*slab).cast()), SLAB_SIZE);
+            }
+        }
+
+        let mut state = self.state.lock();
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.pool_lock_count += 1;
+            state.metrics.slab_purge_count += count as u64;
+        }
+        for slab in &buf[..count] {
+            let seg = Self::find_segment(&state, *slab as usize);
+            state.seg_outstanding[seg] -= 1;
+            state.clean_list.push(*slab);
         }
     }
 
@@ -299,13 +366,15 @@ impl<P: PageAllocator> PagePool<P> {
         unreachable!("slab does not belong to any segment")
     }
 
-    /// Walk the free list and unlink all slabs belonging to the given segment.
+    /// Walk both free lists and unlink all slabs belonging to the given segment.
     fn remove_segment_slabs(state: &mut PoolState, seg_base: usize) {
         let seg_end = seg_base + SEGMENT_SIZE;
-        state.free_list.remove_if(|slab| {
+        let pred = |slab: Link| {
             let addr = slab as usize;
             addr >= seg_base && addr < seg_end
-        });
+        };
+        state.dirty_list.remove_if(pred);
+        state.clean_list.remove_if(pred);
     }
 
     /// Swap-remove a segment from all tracking arrays.
@@ -477,15 +546,16 @@ mod tests {
         }
     }
 
-    // r[verify pool.alloc-slab]
+    // r[verify pool.alloc-slab] r[verify pool.dirty-reuse]
     #[test]
-    fn dealloc_then_reuse() {
+    fn dealloc_then_reuse_from_dirty() {
         let pool = pool();
         let s1 = pool.alloc_slab().unwrap();
         let addr = s1.as_ptr() as usize;
         pool.dealloc_slab(s1);
+        // Slab goes on dirty list; alloc_slab pops from dirty first.
         let s2 = pool.alloc_slab().unwrap();
-        assert_eq!(s2.as_ptr() as usize, addr, "expected reuse");
+        assert_eq!(s2.as_ptr() as usize, addr, "expected dirty reuse");
         pool.dealloc_slab(s2);
     }
 
@@ -510,39 +580,89 @@ mod tests {
         pool.dealloc_slab(slab);
     }
 
-    // r[verify pool.purge-free-slab] r[verify sys.purge-pages]
+    // r[verify pool.purge-free-slab] r[verify sys.purge-pages] r[verify pool.deferred-purge]
     #[cfg(target_os = "linux")]
     #[test]
-    fn purge_zeroes_slab_pages() {
+    fn purge_zeroes_slab_pages_after_threshold() {
         use crate::sys::MmapAllocator;
         let pool = PagePool::new(MmapAllocator);
 
-        // Allocate two slabs so the segment isn't fully carved, ensuring
-        // dealloc_slab takes the per-slab purge path (not segment munmap).
-        let slab1 = pool.alloc_slab().unwrap();
-        let slab2 = pool.alloc_slab().unwrap();
+        // Allocate enough slabs so that after anchoring one per segment,
+        // the freed count exceeds PURGE_HIGH_WATER.
+        let n = 3 * SLABS_PER_SEGMENT;
+        let mut slabs = Vec::new();
+        for _ in 0..n {
+            slabs.push(pool.alloc_slab().unwrap());
+        }
 
-        // Write non-zero data into slab1.
-        let ptr = slab1.as_ptr().cast::<u8>();
+        // Anchor one slab per segment so no segment gets munmapped.
+        let mut anchors = Vec::new();
+        let mut to_free = Vec::new();
+        let mut seen_segments = std::collections::HashSet::new();
+        for slab in slabs.iter().rev() {
+            let seg_base = slab.as_ptr() as usize & !(SEGMENT_SIZE - 1);
+            if seen_segments.insert(seg_base) {
+                anchors.push(*slab);
+            } else {
+                to_free.push(*slab);
+            }
+        }
+
+        // Pick a target and write non-zero data into it.
+        let target = to_free[0];
+        let ptr = target.as_ptr().cast::<u8>();
         unsafe { core::ptr::write_bytes(ptr, 0xAB, SLAB_SIZE) };
 
-        // Return slab1 — pool calls page_alloc.purge which issues
-        // madvise(MADV_DONTNEED). On Linux, subsequent reads return zeroes.
-        pool.dealloc_slab(slab1);
+        // Free (PURGE_HIGH_WATER - 1) non-target slabs first so the dirty
+        // list is just below threshold.
+        let non_target: Vec<_> = to_free.iter().copied().filter(|s| *s != target).collect();
+        let prefill = PURGE_HIGH_WATER - 1;
+        for slab in &non_target[..prefill] {
+            pool.dealloc_slab(*slab);
+        }
 
-        // Re-allocate — should get slab1 back from the free list.
-        let reused = pool.alloc_slab().unwrap();
-        assert_eq!(reused, slab1);
+        // Free the target — it goes to the dirty list head.
+        pool.dealloc_slab(target);
 
-        // Verify pages are zeroed (MADV_DONTNEED guarantees this on Linux).
-        let slice = unsafe { core::slice::from_raw_parts(reused.as_ptr().cast::<u8>(), SLAB_SIZE) };
-        assert!(
-            slice.iter().all(|&b| b == 0),
-            "purged slab should be zeroed"
-        );
+        // Free one more — dirty_list.len now exceeds PURGE_HIGH_WATER,
+        // triggering purge_excess which pops from the head (including target).
+        pool.dealloc_slab(non_target[prefill]);
 
-        pool.dealloc_slab(reused);
-        pool.dealloc_slab(slab2);
+        // Free the rest.
+        for slab in &non_target[prefill + 1..] {
+            pool.dealloc_slab(*slab);
+        }
+
+        // Re-allocate slabs until we get the target back.
+        let mut found = false;
+        let mut reallocs = Vec::new();
+        for _ in 0..to_free.len() {
+            let s = pool.alloc_slab().unwrap();
+            if s == target {
+                // The free list link occupies the first pointer-sized bytes;
+                // check the rest of the slab for zeroes.
+                let link_size = size_of::<Link>();
+                let slice = unsafe {
+                    core::slice::from_raw_parts(
+                        s.as_ptr().cast::<u8>().add(link_size),
+                        SLAB_SIZE - link_size,
+                    )
+                };
+                assert!(slice.iter().all(|&b| b == 0), "purged slab should be zeroed");
+                found = true;
+                reallocs.push(s);
+                break;
+            }
+            reallocs.push(s);
+        }
+        assert!(found, "target slab was not returned from pool");
+
+        for s in reallocs {
+            pool.dealloc_slab(s);
+        }
+        for s in anchors {
+            pool.dealloc_slab(s);
+        }
     }
 
     // r[verify pool.purge]

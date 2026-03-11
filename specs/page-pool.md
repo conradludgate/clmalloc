@@ -50,18 +50,29 @@ return the physical pages to the OS (e.g. via `madvise(MADV_DONTNEED)` or
 usage drops.
 
 r[pool.purge-free-slab]
-When a slab is returned to the pool free list and the segment will NOT
-be fully purged, the pool MUST release the slab's physical pages back
-to the OS via `PageAllocator::purge`. The virtual address range is
-retained so the slab can be reused without a new mmap. This reduces
-RSS when partially-occupied segments prevent full segment munmap.
+The pool MUST eventually purge or reuse every slab returned to it.
+Purging MAY be deferred to amortize syscall cost.
 
-r[pool.purge-before-publish]
-The pool MUST purge a slab's physical pages BEFORE placing it on the
-free list. If the slab were published first, another thread could pop
-it, reinitialize its header for a new size class, and begin allocating
-from it while the purge is still in flight — zeroing the new header
-and corrupting live metadata.
+r[pool.deferred-purge]
+The pool MUST maintain two tiers of free slabs: a dirty list (physical
+pages still resident) and a clean list (pages purged via
+`PageAllocator::purge`). Returned slabs go onto the dirty list.
+When the dirty count exceeds a high-water mark, the pool MUST purge
+slabs in batch until the count drops to a low-water mark. Purging
+MUST happen outside the pool lock: pop slabs into a thread-local
+buffer, release the lock, purge each slab, re-acquire the lock, and
+push them onto the clean list.
+
+r[pool.dirty-reuse]
+The pool MAY hand out dirty slabs without purging. `Slab::init`
+overwrites the header unconditionally, so stale page contents do not
+affect correctness.
+
+r[pool.purge-not-on-shared-list]
+The pool MUST NOT purge a slab while it is visible on any shared list.
+Purging MUST only happen on slabs held in a thread-local buffer after
+being popped from the dirty list. This prevents a concurrent
+`alloc_slab` from handing out a slab whose pages are being zeroed.
 
 ## Exhaustion
 

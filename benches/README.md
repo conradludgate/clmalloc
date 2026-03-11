@@ -50,10 +50,10 @@ Higher is better.
 
 | Benchmark | clmalloc | jemalloc | mimalloc | system |
 |-----------|----------|----------|----------|--------|
-| larson (M ops/s) | 1,133 | **1,448** | 1,176 | 97 |
-| cache_scratch 1T (ops/s) | 56,370 | 51,367 | 51,223 | **58,258** |
-| cache_scratch 8T (ops/s) | **3,408,244** | 1,766,135 | 3,069,053 | 3,120,176 |
-| tokio_worksteal (tasks/s) | 1,157,720 | 1,187,459 | 1,170,425 | **1,217,922** |
+| larson (M ops/s) | 1,290 | **1,343** | 1,224 | 90 |
+| cache_scratch 1T (ops/s) | **57,604** | 55,935 | 54,799 | 54,303 |
+| cache_scratch 8T (ops/s) | **2,489,110** | 2,144,293 | 2,196,821 | 2,434,108 |
+| tokio_worksteal (tasks/s) | 1,168,618 | 1,183,229 | 1,172,181 | **1,224,495** |
 
 ### Fragmentation — Apple M4 Max (aarch64)
 
@@ -71,16 +71,21 @@ allocator keeps active relative to what the application requested.
 | drain-75% | 2.83 | **2.38** |
 | drain-100% | 90.11 | **4.10** |
 
+Note: clmalloc uses deferred purge with a 64-slab dirty threshold. The
+fragmentation benchmark exercises single-threaded churn on a single size
+class, which does not trigger the high-water purge path — the active
+metric reflects dirty slabs held for fast reuse, not a true leak.
+
 ### Throughput — Intel Xeon 8375C (x86_64, 32 threads)
 
 Higher is better.
 
 | Benchmark | clmalloc | jemalloc | mimalloc | snmalloc | system |
 |-----------|----------|----------|----------|----------|--------|
-| larson (M ops/s) | 19 | 340 | 894 | **999** | 232 |
-| cache_scratch 1T (ops/s) | **55,131** | 54,942 | 54,037 | 55,015 | 54,940 |
-| cache_scratch 8T (ops/s) | 1,588,720 | 2,580,206 | 1,730,797 | **2,947,750** | 611,753 |
-| tokio_worksteal (tasks/s) | 832,905 | 876,086 | 906,352 | **968,087** | 717,646 |
+| larson (M ops/s) | 187 | 340 | 894 | **999** | 232 |
+| cache_scratch 1T (ops/s) | **55,054** | 54,942 | 54,037 | 55,015 | 54,940 |
+| cache_scratch 8T (ops/s) | 1,652,468 | 2,580,206 | 1,730,797 | **2,947,750** | 611,753 |
+| tokio_worksteal (tasks/s) | **1,169,087** | 876,086 | 906,352 | 968,087 | 717,646 |
 
 ### Fragmentation — Intel Xeon 8375C (x86_64)
 
@@ -92,8 +97,8 @@ allocator keeps active relative to what the application requested.
 | ramp-up | 1.07 | **1.00** |
 | close-50% | 2.14 | **1.67** |
 | reopen | 1.44 | **1.10** |
-| churn-2 | 2.43 | **1.40** |
-| drain-25% | 3.31 | **1.50** |
-| drain-50% | 4.96 | **1.67** |
-| drain-75% | 9.74 | **1.78** |
-| drain-100% | 1321.19 | **2.22** |
+| churn-2 | 2.39 | **1.40** |
+| drain-25% | 2.60 | **1.50** |
+| drain-50% | 2.70 | **1.67** |
+| drain-75% | 2.84 | **1.78** |
+| drain-100% | 91.69 | **2.22** |
