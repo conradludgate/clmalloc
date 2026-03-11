@@ -45,6 +45,14 @@ r[alloc.tls-pthread-cleanup]
 Thread-exit cleanup MUST use `pthread_key_create` (or platform equivalent)
 to register a destructor outside Rust's TLS infrastructure.
 
+## Reentrancy
+
+r[alloc.no-reentrant-init]
+Initialization of global allocator state (e.g. TLS key creation) MUST NOT
+use mechanisms that may allocate through the global allocator (such as
+`std::sync::Once`, which may allocate to park contending threads). Lock-free
+atomic CAS or similar allocation-free synchronization MUST be used instead.
+
 ## Zero-size allocations
 
 r[alloc.zst]

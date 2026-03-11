@@ -8,7 +8,8 @@ use core::alloc::Layout;
 use core::mem::{align_of, size_of};
 use core::ptr::{NonNull, null_mut};
 
-use crate::slab::SLAB_SIZE;
+use crate::size_class::NUM_CLASSES;
+use crate::slab::{Slab, SlabBase, SLAB_SIZE};
 use crate::sys::PageAllocator;
 
 const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB = 32 slabs
@@ -27,6 +28,7 @@ type Link = *mut SlabPage;
 
 struct PoolState {
     free_head: Link,
+    abandoned_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
     segment_cursor: Link,
     segment_end: Link,
     segments: [*mut Segment; MAX_SEGMENTS],
@@ -51,6 +53,7 @@ impl<P: PageAllocator> PagePool<P> {
             page_alloc,
             state: spin::Mutex::new(PoolState {
                 free_head: null_mut::<SlabPage>(),
+                abandoned_heads: [None; NUM_CLASSES],
                 segment_cursor: null_mut::<SlabPage>(),
                 segment_end: null_mut::<SlabPage>(),
                 segments: [null_mut::<Segment>(); MAX_SEGMENTS],
@@ -64,7 +67,7 @@ impl<P: PageAllocator> PagePool<P> {
     /// Fast path: pop from the free list.
     /// Slow path: carve from the current segment.
     /// Slowest path: allocate a new segment from the page allocator.
-    pub fn alloc_slab(&self) -> Option<NonNull<u8>> {
+    pub fn alloc_slab(&self) -> Option<NonNull<SlabBase>> {
         let mut state = self.state.lock();
 
         if !state.free_head.is_null() {
@@ -77,6 +80,7 @@ impl<P: PageAllocator> PagePool<P> {
         if state.segment_cursor >= state.segment_end {
             let base = self.page_alloc.alloc(Layout::new::<Segment>())?;
             let segment = base.as_ptr().cast::<Segment>();
+            // r[impl pool.no-panic-under-lock]
             if state.segment_count >= MAX_SEGMENTS {
                 unsafe { self.page_alloc.dealloc(base, Layout::new::<Segment>()) };
                 return None;
@@ -97,11 +101,35 @@ impl<P: PageAllocator> PagePool<P> {
     ///
     /// The first pointer-sized bytes of the slab's memory are used as the
     /// free list next-pointer (the slab is fully free, so its memory is unused).
-    pub fn dealloc_slab(&self, base: NonNull<u8>) {
+    pub fn dealloc_slab(&self, base: NonNull<SlabBase>) {
         let mut state = self.state.lock();
         let slab: Link = base.as_ptr().cast();
         unsafe { slab.cast::<Link>().write(state.free_head) };
         state.free_head = slab;
+    }
+
+    /// Place a non-fully-free slab on the abandoned list for its size class.
+    ///
+    /// Called during thread exit when a slab still has outstanding allocations.
+    /// Another heap can later adopt it via `adopt_slab`.
+    pub fn abandon_slab(&self, mut slab: Slab) {
+        let class_idx = slab.size_class_index();
+        let mut state = self.state.lock();
+        slab.set_next_abandoned(state.abandoned_heads[class_idx]);
+        state.abandoned_heads[class_idx] = Some(slab.into_raw());
+    }
+
+    /// Try to adopt an abandoned slab for the given size class.
+    ///
+    /// Returns the slab with ownership transferred to the caller.
+    /// The caller must `drain_remote` and `set_heap_id` before use.
+    pub fn adopt_slab(&self, class_idx: usize) -> Option<Slab> {
+        let mut state = self.state.lock();
+        let head = state.abandoned_heads[class_idx]?;
+        let mut slab = unsafe { Slab::from_raw(head) };
+        state.abandoned_heads[class_idx] = slab.next_abandoned();
+        slab.set_next_abandoned(None);
+        Some(slab)
     }
 
     // r[impl pool.large-alloc]

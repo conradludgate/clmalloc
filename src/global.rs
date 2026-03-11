@@ -24,6 +24,7 @@ mod imp {
     /// preventing heap re-creation during late TLS teardown.
     const SENTINEL: *mut HeapTy = std::ptr::dangling_mut::<HeapTy>();
 
+    // r[impl alloc.no-reentrant-init]
     /// Atomic key storage: -1 = uninitialized, >= 0 = valid key.
     /// Using atomics instead of `std::sync::Once` because `Once` may
     /// internally allocate when parking contending threads, causing

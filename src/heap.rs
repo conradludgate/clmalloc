@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::pool::PagePool;
 use crate::size_class::{self, NUM_CLASSES};
-use crate::slab::{Slab, SlabRef};
+use crate::slab::{Slab, SlabBase, SlabRef};
 use crate::sys::PageAllocator;
 
 static NEXT_HEAP_ID: AtomicUsize = AtomicUsize::new(1);
@@ -26,6 +26,10 @@ pub struct Heap<'pool, P: PageAllocator> {
     // r[impl heap.identity]
     id: usize,
     bins: [Option<Slab>; NUM_CLASSES],
+    /// Exhausted slabs kept for local dealloc. Chained via `next_abandoned`
+    /// pointer in the slab header. Deallocs landing on these slabs use the
+    /// local free list (no atomics). Promoted back to active when slots free up.
+    retired_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
 }
 
 impl<'pool, P: PageAllocator> Heap<'pool, P> {
@@ -36,6 +40,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             pool,
             id: next_heap_id(),
             bins: [NONE; NUM_CLASSES],
+            retired_heads: [None; NUM_CLASSES],
         }
     }
 
@@ -59,18 +64,50 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             if let Some(ptr) = slab.alloc() {
                 return Some(ptr);
             }
-            self.retire_slab(idx);
+            self.retire_active(idx);
+        }
+
+        // Walk retired list: find a slab with free slots and promote it.
+        self.promote_retired(idx);
+        if self.bins[idx].is_some() {
+            return self.alloc(layout);
         }
 
         self.request_slab(idx)
     }
 
     fn request_slab(&mut self, class_idx: usize) -> Option<NonNull<u8>> {
+        if let Some(ptr) = self.try_adopt(class_idx) {
+            return Some(ptr);
+        }
         let raw = self.pool.alloc_slab()?;
         let mut slab = unsafe { Slab::init(raw, class_idx as u8, self.id) };
         let ptr = slab.alloc();
         self.bins[class_idx] = Some(slab);
         ptr
+    }
+
+    // r[impl heap.abandon]
+    fn try_adopt(&mut self, class_idx: usize) -> Option<NonNull<u8>> {
+        // Drain the abandoned list: return fully-free slabs to the pool,
+        // adopt the first slab that has allocable slots.
+        while let Some(mut slab) = self.pool.adopt_slab(class_idx) {
+            slab.set_heap_id(self.id);
+            slab.drain_remote();
+            if slab.is_fully_free() {
+                self.pool.dealloc_slab(slab.into_raw());
+                continue;
+            }
+            if let Some(ptr) = slab.alloc() {
+                self.bins[class_idx] = Some(slab);
+                return Some(ptr);
+            }
+            // Still full after drain — put it back and stop scanning.
+            // Remote frees haven't arrived yet; a fresh slab is needed.
+            self.pool.abandon_slab(slab);
+            break;
+        }
+        None
     }
 
     // r[impl heap.alloc-fast-path]
@@ -86,12 +123,23 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
 
         let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
 
-        if slab_ref.heap_id() == self.id
-            && let Some(active) = &mut self.bins[idx]
-            && active.as_ref().header_eq(&slab_ref)
-        {
-            active.dealloc_local(ptr);
-            return;
+        if slab_ref.heap_id() == self.id {
+            if let Some(active) = &mut self.bins[idx]
+                && active.as_ref().header_eq(&slab_ref)
+            {
+                active.dealloc_local(ptr);
+                return;
+            }
+            // Walk the retired list for this class.
+            let mut cursor = self.retired_heads[idx];
+            while let Some(base) = cursor {
+                let mut slab = unsafe { Slab::from_raw(base) };
+                if slab.as_ref().header_eq(&slab_ref) {
+                    slab.dealloc_local(ptr);
+                    return;
+                }
+                cursor = slab.next_abandoned();
+            }
         }
 
         slab_ref.dealloc_remote(ptr);
@@ -102,17 +150,60 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         for slab in self.bins.iter_mut().flatten() {
             slab.drain_remote();
         }
+        for idx in 0..NUM_CLASSES {
+            let mut cursor = self.retired_heads[idx];
+            while let Some(base) = cursor {
+                let mut slab = unsafe { Slab::from_raw(base) };
+                slab.drain_remote();
+                cursor = slab.next_abandoned();
+            }
+        }
     }
 
+    /// Walk the retired list for `class_idx`. Drain remote on each slab:
+    /// - Fully free → return to pool and unlink.
+    /// - Has free slots → unlink and promote to active bin.
+    /// - Still full → leave in list.
+    fn promote_retired(&mut self, class_idx: usize) {
+        let mut prev: *mut Option<NonNull<SlabBase>> = &mut self.retired_heads[class_idx];
+        while let Some(base) = unsafe { *prev } {
+            let mut slab = unsafe { Slab::from_raw(base) };
+            let next = slab.next_abandoned();
+            slab.drain_remote();
+            if slab.is_fully_free() {
+                unsafe { *prev = next };
+                self.pool.dealloc_slab(slab.into_raw());
+                continue;
+            }
+            if slab.free_count() > 0 {
+                unsafe { *prev = next };
+                slab.set_next_abandoned(None);
+                self.bins[class_idx] = Some(slab);
+                return;
+            }
+            prev = slab.next_abandoned_mut();
+        }
+    }
+
+    /// Move the exhausted active slab to the retired linked list for its class.
+    fn retire_active(&mut self, class_idx: usize) {
+        if let Some(mut slab) = self.bins[class_idx].take() {
+            slab.set_next_abandoned(self.retired_heads[class_idx]);
+            self.retired_heads[class_idx] = Some(slab.into_raw());
+        }
+    }
+
+    /// Retire the active slab during thread exit. Fully-free slabs go back
+    /// to the pool; partially-used slabs are abandoned for adoption.
     fn retire_slab(&mut self, class_idx: usize) {
         if let Some(mut slab) = self.bins[class_idx].take() {
             slab.drain_remote();
             if slab.is_fully_free() {
                 self.pool.dealloc_slab(slab.into_raw());
+            } else {
+                // r[impl heap.abandon]
+                self.pool.abandon_slab(slab);
             }
-            // v1: non-fully-free retired slabs are dropped. The backing memory
-            // stays valid (pool segments are never unmapped), and remote frees
-            // continue to work via SlabRef. Slots on the remote list are leaked.
         }
     }
 }
@@ -122,6 +213,20 @@ impl<P: PageAllocator> Drop for Heap<'_, P> {
     fn drop(&mut self) {
         for idx in 0..NUM_CLASSES {
             self.retire_slab(idx);
+            // Drain the retired list: return free slabs to pool, abandon the rest.
+            let mut cursor = self.retired_heads[idx].take();
+            while let Some(base) = cursor {
+                let mut slab = unsafe { Slab::from_raw(base) };
+                cursor = slab.next_abandoned();
+                slab.set_next_abandoned(None);
+                slab.drain_remote();
+                if slab.is_fully_free() {
+                    self.pool.dealloc_slab(slab.into_raw());
+                } else {
+                    // r[impl heap.abandon]
+                    self.pool.abandon_slab(slab);
+                }
+            }
         }
     }
 }
@@ -275,5 +380,93 @@ mod tests {
         let recovered = heap.alloc(layout).unwrap();
         assert_eq!(recovered.as_ptr() as usize, raw);
         unsafe { heap.dealloc(recovered, layout) };
+    }
+
+    // r[verify heap.abandon]
+    #[test]
+    fn abandoned_slab_is_adopted_by_new_heap() {
+        let pool = pool();
+        let layout = Layout::from_size_align(64, 1).unwrap();
+
+        let outstanding_ptr;
+        {
+            let mut heap1 = Heap::new(&pool);
+            outstanding_ptr = heap1.alloc(layout).unwrap();
+            // heap1 drops here — slab has 1 outstanding alloc, gets abandoned
+        }
+
+        let mut heap2 = Heap::new(&pool);
+        // heap2's first alloc for this class should adopt the abandoned slab
+        let ptr2 = heap2.alloc(layout).unwrap();
+        let slab_ref1 = unsafe { SlabRef::from_interior_ptr(outstanding_ptr.as_ptr()) };
+        let slab_ref2 = unsafe { SlabRef::from_interior_ptr(ptr2.as_ptr()) };
+        assert!(slab_ref1.header_eq(&slab_ref2), "heap2 should adopt heap1's slab");
+
+        // heap_id should now be heap2's
+        assert_eq!(slab_ref2.heap_id(), heap2.id());
+
+        unsafe { heap2.dealloc(outstanding_ptr, layout) };
+        unsafe { heap2.dealloc(ptr2, layout) };
+    }
+
+    // r[verify heap.abandon]
+    #[test]
+    fn abandoned_slab_with_remote_frees_after_abandon() {
+        let pool = Arc::new(pool());
+        let layout = Layout::from_size_align(64, 1).unwrap();
+
+        let raw_ptr;
+        {
+            let mut heap1 = Heap::new(&pool);
+            let ptr = heap1.alloc(layout).unwrap();
+            raw_ptr = ptr.as_ptr() as usize;
+            // heap1 drops — slab abandoned with 1 outstanding slot
+        }
+
+        // Simulate a remote free arriving after abandonment
+        let slab_ref = unsafe { SlabRef::from_interior_ptr(raw_ptr as *const u8) };
+        slab_ref.dealloc_remote(NonNull::new(raw_ptr as *mut u8).unwrap());
+
+        // heap2 adopts — after drain_remote the slab should be fully free
+        // and returned to the pool, so heap2 gets a fresh slab instead
+        let mut heap2 = Heap::new(&pool);
+        let ptr2 = heap2.alloc(layout).unwrap();
+        let slab_ref2 = unsafe { SlabRef::from_interior_ptr(ptr2.as_ptr()) };
+        assert_eq!(slab_ref2.heap_id(), heap2.id());
+
+        unsafe { heap2.dealloc(ptr2, layout) };
+    }
+
+    // r[verify heap.abandon]
+    #[test]
+    fn cross_thread_abandon_adopt() {
+        let pool = Arc::new(pool());
+        let layout = Layout::from_size_align(256, 1).unwrap();
+        let pool2 = Arc::clone(&pool);
+
+        let raw_ptrs: Vec<usize> = std::thread::spawn(move || {
+            let mut heap = Heap::new(&pool2);
+            let mut ptrs = Vec::new();
+            for _ in 0..10 {
+                ptrs.push(heap.alloc(layout).unwrap().as_ptr() as usize);
+            }
+            // heap drops — slab abandoned with 10 outstanding allocs
+            ptrs
+        })
+        .join()
+        .unwrap();
+
+        let mut heap2 = Heap::new(&pool);
+        // heap2 should adopt the abandoned slab
+        let new_ptr = heap2.alloc(layout).unwrap();
+        let new_slab_ref = unsafe { SlabRef::from_interior_ptr(new_ptr.as_ptr()) };
+        let old_slab_ref = unsafe { SlabRef::from_interior_ptr(raw_ptrs[0] as *const u8) };
+        assert!(old_slab_ref.header_eq(&new_slab_ref), "should adopt the abandoned slab");
+
+        // Free everything
+        for raw in &raw_ptrs {
+            unsafe { heap2.dealloc(NonNull::new(*raw as *mut u8).unwrap(), layout) };
+        }
+        unsafe { heap2.dealloc(new_ptr, layout) };
     }
 }

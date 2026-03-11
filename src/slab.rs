@@ -35,6 +35,11 @@ use crate::sync::{AtomicPtr, Ordering, UnsafeCell};
 pub const SLAB_SIZE: usize = 1 << 16; // 64KB
 const SLAB_MASK: usize = !(SLAB_SIZE - 1);
 
+/// Opaque type representing a slab's memory region. Used as a typed pointer
+/// target (`NonNull<SlabBase>`) instead of raw `NonNull<u8>` for slab bases.
+#[repr(C, align(65536))]
+pub struct SlabBase([u8; SLAB_SIZE]);
+
 // -- Core unsafe primitives for intrusive free list --
 //
 // Every free slot stores a next-pointer in its first pointer-sized bytes.
@@ -68,6 +73,7 @@ struct SlabHeader {
     size_class_index: u8,
     // r[impl heap.identity]
     heap_id: usize,
+    next_abandoned: Option<NonNull<SlabBase>>,
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
     local: UnsafeCell<LocalState>,
     // r[impl slab.remote-freelist]
@@ -102,6 +108,7 @@ impl SlabHeader {
                     slots_offset: slots_offset as u16,
                     size_class_index,
                     heap_id,
+                    next_abandoned: None,
                     local: UnsafeCell::new(LocalState {
                         head: prev,
                         free_count: slot_count as u16,
@@ -147,8 +154,8 @@ impl Slab {
     /// - `base` must be `SLAB_SIZE`-aligned, pointing to `SLAB_SIZE` bytes of
     ///   valid, writable memory.
     /// - No concurrent access to the region during init.
-    pub unsafe fn init(base: NonNull<u8>, size_class_index: u8, heap_id: usize) -> Slab {
-        let header = unsafe { SlabHeader::init(base, size_class_index, heap_id) };
+    pub unsafe fn init(base: NonNull<SlabBase>, size_class_index: u8, heap_id: usize) -> Slab {
+        let header = unsafe { SlabHeader::init(base.cast(), size_class_index, heap_id) };
         Slab { header }
     }
 
@@ -165,12 +172,41 @@ impl Slab {
         }
     }
 
+    /// Reconstruct an owner handle from a raw slab base pointer.
+    ///
+    /// # Safety
+    /// - `base` must point to a previously initialized slab.
+    /// - No other `Slab` handle may exist for this base.
+    pub unsafe fn from_raw(base: NonNull<SlabBase>) -> Slab {
+        Slab {
+            header: base.cast(),
+        }
+    }
+
     /// Consume the owner handle, returning the raw slab base pointer.
     ///
     /// The caller (page pool) takes responsibility for the backing memory.
     /// The slab must be fully free (all slots returned) before calling this.
-    pub fn into_raw(self) -> NonNull<u8> {
+    pub fn into_raw(self) -> NonNull<SlabBase> {
         self.header.cast()
+    }
+
+    pub fn set_heap_id(&mut self, id: usize) {
+        unsafe { (*self.header.as_ptr()).heap_id = id };
+    }
+
+    pub(crate) fn next_abandoned(&self) -> Option<NonNull<SlabBase>> {
+        self.header().next_abandoned
+    }
+
+    pub(crate) fn set_next_abandoned(&mut self, next: Option<NonNull<SlabBase>>) {
+        unsafe { (*self.header.as_ptr()).next_abandoned = next };
+    }
+
+    /// Returns a mutable reference to the `next_abandoned` field in the header.
+    /// Used by the heap to thread retired slabs into an intrusive linked list.
+    pub(crate) fn next_abandoned_mut(&mut self) -> &mut Option<NonNull<SlabBase>> {
+        unsafe { &mut (*self.header.as_ptr()).next_abandoned }
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
@@ -183,7 +219,6 @@ impl Slab {
         self.header().slot_count as usize
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn size_class_index(&self) -> usize {
         self.header().size_class_index as usize
     }
@@ -345,7 +380,7 @@ mod tests {
 
     struct TestSlab {
         slab: Slab,
-        ptr: NonNull<u8>,
+        ptr: NonNull<SlabBase>,
         layout: Layout,
     }
 
@@ -354,7 +389,7 @@ mod tests {
             let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
             let ptr = unsafe {
                 let p = alloc_zeroed(layout);
-                NonNull::new(p).expect("aligned alloc failed")
+                NonNull::new(p).expect("aligned alloc failed").cast::<SlabBase>()
             };
             let slab = unsafe { Slab::init(ptr, size_class_index, 0) };
             Self { slab, ptr, layout }
@@ -363,7 +398,7 @@ mod tests {
 
     impl Drop for TestSlab {
         fn drop(&mut self) {
-            unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+            unsafe { dealloc(self.ptr.as_ptr().cast(), self.layout) }
         }
     }
 
@@ -551,12 +586,12 @@ mod tests {
         let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
         let base = unsafe {
             let p = alloc_zeroed(layout);
-            NonNull::new(p).expect("aligned alloc failed")
+            NonNull::new(p).expect("aligned alloc failed").cast::<SlabBase>()
         };
         let slab = unsafe { Slab::init(base, 0, 0) };
         let returned = slab.into_raw();
         assert_eq!(returned, base);
-        unsafe { dealloc(returned.as_ptr(), layout) };
+        unsafe { dealloc(returned.as_ptr().cast(), layout) };
     }
 }
 

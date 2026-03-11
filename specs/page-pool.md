@@ -27,6 +27,13 @@ r[pool.batch-mmap]
 The page pool SHOULD request memory from the OS in large batches (e.g.
 2 MiB or more) and carve slabs from the batch, to amortize syscall cost.
 
+## Exhaustion
+
+r[pool.no-panic-under-lock]
+Operations that hold the pool lock MUST NOT panic. If a capacity limit is
+reached, the operation MUST return `None` to the caller. Panicking while
+holding the lock causes deadlock because the panic handler allocates.
+
 ## Large allocations
 
 r[pool.large-alloc]
