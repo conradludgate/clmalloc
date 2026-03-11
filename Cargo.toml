@@ -3,6 +3,9 @@ name = "clmalloc"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [features]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
@@ -26,6 +29,7 @@ name = "tokio_worksteal"
 harness = false
 
 [dev-dependencies]
+loom = "0.7"
 rand = "0.10.0"
 rand_xoshiro = "0.8.0"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }

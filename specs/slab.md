@@ -15,13 +15,16 @@ Each slab MUST serve exactly one size class. All slots within a slab are
 the same size.
 
 r[slab.metadata]
-Slab metadata (owning thread, size class, free lists) MUST be stored at a
-fixed offset within the slab (e.g. the slab header) so it can be located
-in O(1) from any pointer within the slab.
+Slab metadata (size class, free lists) MUST be stored at a fixed offset
+within the slab (e.g. the slab header) so it can be located in O(1) from
+any pointer within the slab.
 
 r[slab.owner]
-Each slab MUST record which thread-local heap owns it. This is used to
-distinguish local vs remote deallocation.
+Each slab MUST have exactly one owner. Ownership MUST be expressed through
+handle types: an owner handle (`Slab`) that requires exclusive access for
+local operations, and a shared handle (`SlabRef`) that only permits atomic
+remote deallocation. Determining whether a deallocation is local or remote
+is the responsibility of the heap layer.
 
 ## Local free list
 
