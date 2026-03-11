@@ -71,6 +71,29 @@ allocator keeps active relative to what the application requested.
 | drain-75% | 2.83 | **2.38** |
 | drain-100% | 90.11 | **4.10** |
 
-### x86_64-v3
+### Throughput — Intel Xeon 8375C (x86_64, 32 threads)
 
-Coming soon.
+Higher is better.
+
+| Benchmark | clmalloc | jemalloc | mimalloc | snmalloc | system |
+|-----------|----------|----------|----------|----------|--------|
+| larson (M ops/s) | 19 | 340 | 894 | **999** | 232 |
+| cache_scratch 1T (ops/s) | **55,131** | 54,942 | 54,037 | 55,015 | 54,940 |
+| cache_scratch 8T (ops/s) | 1,588,720 | 2,580,206 | 1,730,797 | **2,947,750** | 611,753 |
+| tokio_worksteal (tasks/s) | 832,905 | 876,086 | 906,352 | **968,087** | 717,646 |
+
+### Fragmentation — Intel Xeon 8375C (x86_64)
+
+active/allocated ratio (lower is better). Measures how much memory the
+allocator keeps active relative to what the application requested.
+
+| Phase | clmalloc | jemalloc |
+|-------|----------|----------|
+| ramp-up | 1.07 | **1.00** |
+| close-50% | 2.14 | **1.67** |
+| reopen | 1.44 | **1.10** |
+| churn-2 | 2.43 | **1.40** |
+| drain-25% | 3.31 | **1.50** |
+| drain-50% | 4.96 | **1.67** |
+| drain-75% | 9.74 | **1.78** |
+| drain-100% | 1321.19 | **2.22** |
