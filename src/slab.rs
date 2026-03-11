@@ -49,14 +49,14 @@ pub struct SlabBase([u8; SLAB_SIZE]);
 
 type Link = *mut u8;
 
-#[inline(always)]
+#[inline]
 unsafe fn read_next(slot: NonNull<u8>) -> Link {
     // SAFETY: Caller guarantees slot points to an allocated slot with at least
     // pointer-sized bytes for the free-list link.
     unsafe { slot.as_ptr().cast::<Link>().read_unaligned() }
 }
 
-#[inline(always)]
+#[inline]
 pub(crate) unsafe fn write_next(slot: NonNull<u8>, next: Link) {
     // SAFETY: Caller guarantees slot points to an allocated slot with at least
     // pointer-sized bytes for the free-list link.
@@ -201,6 +201,8 @@ impl SlabHeader {
         let slot_count = (SLAB_SIZE - slots_offset) / slot_size;
         debug_assert!(slot_count > 0 && u16::try_from(slot_count).is_ok());
 
+        // SAFETY: base is a slab-aligned page from the pool; SlabHeader alignment is satisfied.
+        #[expect(clippy::cast_ptr_alignment)]
         let header = base.as_ptr().cast::<SlabHeader>();
         // SAFETY: base is a valid, exclusively-owned slab page; slot_size/slot_count/class
         // are correct for the size class (validated by debug_assert above).

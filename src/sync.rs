@@ -19,18 +19,18 @@ pub(crate) struct UnsafeCell<T>(core::cell::UnsafeCell<T>);
 
 #[cfg(not(loom))]
 impl<T> UnsafeCell<T> {
-    #[inline(always)]
+    #[inline]
     pub const fn new(data: T) -> Self {
         Self(core::cell::UnsafeCell::new(data))
     }
 
-    #[inline(always)]
+    #[inline]
     #[allow(dead_code)]
     pub fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
         f(self.0.get())
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
         f(self.0.get())
     }

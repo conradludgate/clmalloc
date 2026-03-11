@@ -216,7 +216,9 @@ impl<P: PageAllocator> PagePool<P> {
         } else {
             state.carving_idx = seg_idx;
             // SAFETY: base is page-aligned from mmap; SlabPage has SLAB_SIZE alignment.
-            state.segment_cursor = unsafe { base.as_ptr().cast::<SlabPage>().add(1) };
+            #[expect(clippy::cast_ptr_alignment)]
+            let cursor = unsafe { base.as_ptr().cast::<SlabPage>().add(1) };
+            state.segment_cursor = cursor;
             // SAFETY: base + SEGMENT_SIZE is within the allocated segment.
             state.segment_end = unsafe { base.as_ptr().add(SEGMENT_SIZE).cast() };
         }
