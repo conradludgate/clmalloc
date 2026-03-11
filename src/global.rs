@@ -35,6 +35,14 @@ mod imp {
     unsafe extern "C" fn heap_destructor(ptr: *mut libc::c_void) {
         let key = PTHREAD_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
         if !ptr.is_null() && ptr != SENTINEL as *mut libc::c_void {
+            #[cfg(feature = "metrics")]
+            unsafe {
+                let heap = ptr as *const HeapTy;
+                let metrics_ptr = core::cell::UnsafeCell::raw_get(
+                    core::ptr::addr_of!((*heap).metrics),
+                ) as *const _;
+                (*heap).pool().deregister_heap(metrics_ptr);
+            }
             unsafe { ptr::drop_in_place(ptr as *mut HeapTy) };
             unsafe { libc::free(ptr) };
         }
@@ -99,8 +107,30 @@ mod imp {
                 return ptr;
             }
             unsafe { ptr::write(ptr, Heap::new(&self.pool)) };
+            #[cfg(feature = "metrics")]
+            self.pool.register_heap(unsafe {
+                core::cell::UnsafeCell::raw_get(core::ptr::addr_of!((*ptr).metrics))
+                    as *const _
+            });
             unsafe { libc::pthread_setspecific(key, ptr as *mut libc::c_void) };
             ptr
+        }
+
+        #[cfg(feature = "metrics")]
+        pub fn snapshot(&'static self) -> crate::metrics::MetricsSnapshot {
+            self.pool.snapshot()
+        }
+
+        // r[impl pprof.activate]
+        #[cfg(feature = "pprof")]
+        pub fn set_prof_active(&self, active: bool) {
+            crate::pprof::set_prof_active(active);
+        }
+
+        // r[impl pprof.dump-api]
+        #[cfg(feature = "pprof")]
+        pub fn dump_heap_profile(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+            crate::pprof::dump(writer)
         }
     }
 

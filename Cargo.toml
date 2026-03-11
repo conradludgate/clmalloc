@@ -8,12 +8,17 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [features]
 clmalloc = []
+metrics = []
+pprof = ["dep:backtrace", "dep:flate2", "dep:rand"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 snmalloc = ["dep:snmalloc-rs"]
 
 [dependencies]
+backtrace = { version = "0.3", optional = true }
+flate2 = { version = "1", optional = true }
 libc = "0.2"
+rand = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
 mimalloc = { version = "0.1.48", optional = true }
 snmalloc-rs = { version = "0.3.8", optional = true }
 spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }

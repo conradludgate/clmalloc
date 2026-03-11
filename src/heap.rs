@@ -83,19 +83,28 @@ pub struct Heap<'pool, P: PageAllocator> {
     full_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
     partial_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
     caches: [FreeCache; NUM_CLASSES],
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics: core::cell::UnsafeCell<crate::metrics::HeapMetrics>,
+    #[cfg(feature = "pprof")]
+    sampler: crate::pprof::Sampler,
 }
 
 impl<'pool, P: PageAllocator> Heap<'pool, P> {
     // r[impl heap.thread-local]
     pub fn new(pool: &'pool PagePool<P>) -> Self {
         const NONE: Option<Slab> = None;
+        let id = next_heap_id();
         Self {
             pool,
-            id: next_heap_id(),
+            id,
             bins: [NONE; NUM_CLASSES],
             full_heads: [None; NUM_CLASSES],
             partial_heads: [None; NUM_CLASSES],
             caches: [FreeCache::EMPTY; NUM_CLASSES],
+            #[cfg(feature = "metrics")]
+            metrics: core::cell::UnsafeCell::new(crate::metrics::HeapMetrics::ZERO),
+            #[cfg(feature = "pprof")]
+            sampler: crate::pprof::Sampler::new(id as u64),
         }
     }
 
@@ -104,25 +113,72 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         self.id
     }
 
+    #[cfg_attr(not(feature = "metrics"), expect(dead_code))]
+    pub fn pool(&self) -> &'pool PagePool<P> {
+        self.pool
+    }
+
+    /// Shared reference to the metrics counters. The `UnsafeCell` wrapper
+    /// prevents `&mut Heap` from invalidating raw pointers stored in the
+    /// pool's heap registry (Stacked Borrows). Interior mutability is
+    /// provided by `AtomicU64` fields.
+    #[cfg(feature = "metrics")]
+    #[inline(always)]
+    pub(crate) fn metrics(&self) -> &crate::metrics::HeapMetrics {
+        unsafe { &*self.metrics.get() }
+    }
+
+    #[cfg(feature = "pprof")]
+    #[inline(always)]
+    fn maybe_sample(&mut self, ptr: NonNull<u8>, size: usize, class_idx: u8) {
+        if crate::pprof::should_sample() && self.sampler.check(size) {
+            crate::pprof::record_sample(ptr.as_ptr(), size, class_idx);
+        }
+    }
+
     // r[impl heap.alloc-fast-path] r[impl heap.slab-request] r[impl heap.free-cache]
     // r[impl heap.page-queue]
     #[inline]
     pub fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         let idx = match size_class::class_index(layout) {
             Some(idx) => idx,
-            None => return self.pool.alloc_large(layout),
+            None => {
+                let ptr = self.pool.alloc_large(layout)?;
+                #[cfg(feature = "metrics")]
+                self.metrics().on_large_alloc(layout.size());
+                #[cfg(feature = "pprof")]
+                self.maybe_sample(ptr, layout.size(), u8::MAX);
+                return Some(ptr);
+            }
         };
 
+        let class_size = size_class::class_size(idx);
+
         if let Some(ptr) = self.caches[idx].pop() {
+            #[cfg(feature = "metrics")]
+            {
+                self.metrics().on_alloc(idx, class_size);
+                self.metrics().on_cache_hit(idx);
+            }
+            #[cfg(feature = "pprof")]
+            self.maybe_sample(ptr, class_size, idx as u8);
             return Some(ptr);
         }
 
         if let Some(slab) = &mut self.bins[idx] {
             if let Some(ptr) = slab.alloc() {
+                #[cfg(feature = "metrics")]
+                self.metrics().on_alloc(idx, class_size);
+                #[cfg(feature = "pprof")]
+                self.maybe_sample(ptr, class_size, idx as u8);
                 return Some(ptr);
             }
             slab.drain_remote();
             if let Some(ptr) = slab.alloc() {
+                #[cfg(feature = "metrics")]
+                self.metrics().on_alloc(idx, class_size);
+                #[cfg(feature = "pprof")]
+                self.maybe_sample(ptr, class_size, idx as u8);
                 return Some(ptr);
             }
             self.retire_active(idx);
@@ -143,19 +199,36 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             return self.alloc(layout);
         }
 
-        self.request_slab(idx)
+        self.request_slab(idx, class_size)
     }
 
     #[cold]
     #[inline(never)]
-    fn request_slab(&mut self, class_idx: usize) -> Option<NonNull<u8>> {
+    fn request_slab(
+        &mut self,
+        class_idx: usize,
+        #[cfg_attr(not(any(feature = "metrics", feature = "pprof")), expect(unused))]
+        class_size: usize,
+    ) -> Option<NonNull<u8>> {
         if let Some(ptr) = self.try_adopt(class_idx) {
+            #[cfg(feature = "metrics")]
+            self.metrics().on_alloc(class_idx, class_size);
+            #[cfg(feature = "pprof")]
+            self.maybe_sample(ptr, class_size, class_idx as u8);
             return Some(ptr);
         }
         let raw = self.pool.alloc_slab()?;
         let mut slab = unsafe { Slab::init(raw, class_idx as u8, self.id) };
         let ptr = slab.alloc();
         self.bins[class_idx] = Some(slab);
+        #[cfg(feature = "metrics")]
+        if ptr.is_some() {
+            self.metrics().on_alloc(class_idx, class_size);
+        }
+        #[cfg(feature = "pprof")]
+        if let Some(p) = ptr {
+            self.maybe_sample(p, class_size, class_idx as u8);
+        }
         ptr
     }
 
@@ -203,10 +276,22 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     ///   same `PagePool`.
     /// - `layout` must match the layout passed to the original `alloc` call.
     pub unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        #[cfg(feature = "pprof")]
+        if crate::pprof::should_sample() {
+            crate::pprof::maybe_remove_sample(ptr.as_ptr());
+        }
+
         let idx = match size_class::class_index(layout) {
             Some(idx) => idx,
-            None => return unsafe { self.pool.dealloc_large(ptr, layout) },
+            None => {
+                #[cfg(feature = "metrics")]
+                self.metrics().on_large_dealloc(layout.size());
+                return unsafe { self.pool.dealloc_large(ptr, layout) };
+            }
         };
+
+        #[cfg(feature = "metrics")]
+        self.metrics().on_dealloc(idx, size_class::class_size(idx));
 
         if let Some(active) = &mut self.bins[idx] {
             let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
@@ -312,15 +397,19 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cold]
     #[inline(never)]
     fn flush_cache(&mut self, class_idx: usize) {
-        let cache = &mut self.caches[class_idx];
-        let n = cache.count as usize;
+        let n = self.caches[class_idx].count as usize;
         if n == 0 {
             return;
         }
 
+        #[cfg(feature = "metrics")]
+        // Field access (not method call) so the borrow checker sees
+        // self.metrics and self.caches as disjoint borrows.
+        unsafe { &*self.metrics.get() }.on_cache_flush(class_idx);
+
         // Sort entries by slab base so consecutive entries for the same slab
         // are adjacent. Insertion sort is fine for <=64 elements.
-        let entries = &mut cache.entries[..n];
+        let entries = &mut self.caches[class_idx].entries[..n];
         for i in 1..n {
             let key = entries[i];
             let mut j = i;
@@ -356,6 +445,8 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
                 }
             } else {
                 // Remote slab: chain entries and push the chain in one CAS.
+                #[cfg(feature = "metrics")]
+                unsafe { &*self.metrics.get() }.on_remote_free((i - run_start) as u64);
                 for j in run_start..i - 1 {
                     unsafe { slab::write_next(entries[j], entries[j + 1].as_ptr()) };
                 }
@@ -363,7 +454,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             }
         }
 
-        cache.count = 0;
+        self.caches[class_idx].count = 0;
 
         // Speculatively drain remote frees on the active slab. If the
         // caller is about to exhaust the slab and enter promote_retired,
@@ -736,5 +827,107 @@ mod tests {
             unsafe { heap2.dealloc(NonNull::new(*raw as *mut u8).unwrap(), layout) };
         }
         unsafe { heap2.dealloc(new_ptr, layout) };
+    }
+
+    // r[verify metrics.class-alloc-count] r[verify metrics.class-dealloc-count]
+    // r[verify metrics.class-alloc-bytes] r[verify metrics.class-free-bytes]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_counter_accuracy() {
+        let pool = pool();
+        let mut heap = Heap::new(&pool);
+        let layout = Layout::from_size_align(64, 1).unwrap();
+        let idx = size_class::class_index(layout).unwrap();
+        let cs = size_class::class_size(idx) as u64;
+
+        let p1 = heap.alloc(layout).unwrap();
+        let p2 = heap.alloc(layout).unwrap();
+        use core::sync::atomic::Ordering::Relaxed;
+        assert_eq!(heap.metrics().class_alloc_count[idx].load(Relaxed), 2);
+        assert_eq!(heap.metrics().class_alloc_bytes[idx].load(Relaxed), 2 * cs);
+        assert_eq!(heap.metrics().alloc_bytes.load(Relaxed), 2 * cs);
+
+        unsafe { heap.dealloc(p1, layout) };
+        assert_eq!(heap.metrics().class_dealloc_count[idx].load(Relaxed), 1);
+        assert_eq!(heap.metrics().free_bytes.load(Relaxed), cs);
+
+        unsafe { heap.dealloc(p2, layout) };
+        assert_eq!(heap.metrics().class_dealloc_count[idx].load(Relaxed), 2);
+    }
+
+    // r[verify metrics.cache-hit-count]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_cache_hit_counted() {
+        let pool = pool();
+        let mut heap = Heap::new(&pool);
+        let layout = Layout::from_size_align(64, 1).unwrap();
+        let idx = size_class::class_index(layout).unwrap();
+
+        // Fill the first slab to force a second.
+        let first_ptr = heap.alloc(layout).unwrap();
+        let first_slab = unsafe { SlabRef::from_interior_ptr(first_ptr.as_ptr()) };
+        let slot_count = first_slab.slot_count();
+        let mut first_ptrs = vec![first_ptr];
+        for _ in 1..slot_count {
+            first_ptrs.push(heap.alloc(layout).unwrap());
+        }
+
+        // Second slab becomes active.
+        let _second_ptr = heap.alloc(layout).unwrap();
+
+        // Free from first slab → goes to cache.
+        let cached = first_ptrs.pop().unwrap();
+        unsafe { heap.dealloc(cached, layout) };
+
+        use core::sync::atomic::Ordering::Relaxed;
+        let before = heap.metrics().cache_hit_count[idx].load(Relaxed);
+        // Alloc should hit the cache.
+        let _recovered = heap.alloc(layout).unwrap();
+        assert_eq!(heap.metrics().cache_hit_count[idx].load(Relaxed), before + 1);
+    }
+
+    // r[verify metrics.large-alloc-count] r[verify metrics.large-alloc-bytes]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_large_alloc_tracked() {
+        let pool = pool();
+        let mut heap = Heap::new(&pool);
+        let layout = Layout::from_size_align(1 << 20, 4096).unwrap();
+        let ptr = heap.alloc(layout).unwrap();
+        use core::sync::atomic::Ordering::Relaxed;
+        assert_eq!(heap.metrics().large_alloc_count.load(Relaxed), 1);
+        assert_eq!(heap.metrics().large_alloc_bytes.load(Relaxed), (1 << 20) as u64);
+        unsafe { heap.dealloc(ptr, layout) };
+    }
+
+    // r[verify metrics.global-snapshot]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn snapshot_aggregates_registered_heaps() {
+        let pool = pool();
+        let mut h1 = Heap::new(&pool);
+        let mut h2 = Heap::new(&pool);
+
+        pool.register_heap(h1.metrics.get() as *const _);
+        pool.register_heap(h2.metrics.get() as *const _);
+
+        let layout = Layout::from_size_align(64, 1).unwrap();
+        let idx = size_class::class_index(layout).unwrap();
+        let cs = size_class::class_size(idx) as u64;
+
+        let p1 = h1.alloc(layout).unwrap();
+        let p2 = h2.alloc(layout).unwrap();
+
+        let snap = pool.snapshot();
+        assert_eq!(snap.class_alloc_count[idx], 2);
+        assert_eq!(snap.alloc_bytes, 2 * cs);
+        assert_eq!(snap.class_live_count[idx], 2);
+
+        unsafe { h1.dealloc(p1, layout) };
+        unsafe { h2.dealloc(p2, layout) };
+
+        pool.deregister_heap(h1.metrics.get() as *const _);
+        pool.deregister_heap(h2.metrics.get() as *const _);
     }
 }

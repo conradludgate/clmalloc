@@ -44,6 +44,8 @@ struct PoolState {
     /// heap or on the abandoned list — i.e. not on the free list and not
     /// still uncarved).
     seg_outstanding: [u8; MAX_SEGMENTS],
+    #[cfg(feature = "metrics")]
+    metrics: crate::metrics::PoolMetrics,
 }
 
 // SAFETY: PoolState is only accessed under the spin lock.
@@ -71,6 +73,8 @@ impl<P: PageAllocator> PagePool<P> {
                 segments: [null_mut::<Segment>(); MAX_SEGMENTS],
                 segment_count: 0,
                 seg_outstanding: [0; MAX_SEGMENTS],
+                #[cfg(feature = "metrics")]
+                metrics: crate::metrics::PoolMetrics::new(),
             }),
         }
     }
@@ -84,6 +88,10 @@ impl<P: PageAllocator> PagePool<P> {
     #[cold]
     pub fn alloc_slab(&self) -> Option<NonNull<SlabBase>> {
         let mut state = self.state.lock();
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.pool_lock_count += 1;
+        }
 
         if !state.free_head.is_null() {
             let slab = state.free_head;
@@ -111,6 +119,11 @@ impl<P: PageAllocator> PagePool<P> {
     fn alloc_slab_slow(&self) -> Option<NonNull<SlabBase>> {
         let base = self.page_alloc.alloc(Layout::new::<Segment>())?;
         let mut state = self.state.lock();
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.pool_lock_count += 1;
+            state.metrics.segment_mmap_count += 1;
+        }
 
         // r[impl pool.no-panic-under-lock]
         if state.segment_count >= MAX_SEGMENTS {
@@ -151,6 +164,10 @@ impl<P: PageAllocator> PagePool<P> {
     pub fn dealloc_slab(&self, base: NonNull<SlabBase>) {
         let slab: Link = base.as_ptr().cast();
         let mut state = self.state.lock();
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.pool_lock_count += 1;
+        }
         unsafe { slab.cast::<Link>().write(state.free_head) };
         state.free_head = slab;
 
@@ -161,6 +178,10 @@ impl<P: PageAllocator> PagePool<P> {
             let segment_ptr = state.segments[seg];
             Self::remove_segment_slabs(&mut state, segment_ptr as usize);
             Self::swap_remove_segment(&mut state, seg);
+            #[cfg(feature = "metrics")]
+            {
+                state.metrics.segment_munmap_count += 1;
+            }
             drop(state);
             unsafe {
                 self.page_alloc.dealloc(
@@ -236,6 +257,11 @@ impl<P: PageAllocator> PagePool<P> {
     pub fn abandon_slab(&self, mut slab: Slab) {
         let class_idx = slab.size_class_index();
         let mut state = self.state.lock();
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.pool_lock_count += 1;
+            state.metrics.abandon_count[class_idx] += 1;
+        }
         slab.set_next_link(state.abandoned_heads[class_idx]);
         state.abandoned_heads[class_idx] = Some(slab.into_raw());
     }
@@ -247,7 +273,15 @@ impl<P: PageAllocator> PagePool<P> {
     #[cold]
     pub fn adopt_slab(&self, class_idx: usize) -> Option<Slab> {
         let mut state = self.state.lock();
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.pool_lock_count += 1;
+        }
         let head = state.abandoned_heads[class_idx]?;
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.adopt_count[class_idx] += 1;
+        }
         let mut slab = unsafe { Slab::from_raw(head) };
         state.abandoned_heads[class_idx] = slab.next_link();
         slab.set_next_link(None);
@@ -271,6 +305,28 @@ impl<P: PageAllocator> PagePool<P> {
     #[cold]
     pub unsafe fn dealloc_large(&self, ptr: NonNull<u8>, layout: Layout) {
         unsafe { self.page_alloc.dealloc(ptr, layout) };
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl<P: PageAllocator> PagePool<P> {
+    pub fn register_heap(&self, ptr: *const crate::metrics::HeapMetrics) {
+        self.state.lock().metrics.register_heap(ptr);
+    }
+
+    pub fn deregister_heap(&self, ptr: *const crate::metrics::HeapMetrics) {
+        self.state.lock().metrics.deregister_heap(ptr);
+    }
+
+    // r[impl metrics.global-snapshot] r[impl metrics.global-mapped]
+    pub fn snapshot(&self) -> crate::metrics::MetricsSnapshot {
+        let mut snap = crate::metrics::MetricsSnapshot::new();
+        let state = self.state.lock();
+        snap.mapped = state.segment_count as u64 * SEGMENT_SIZE as u64;
+        state.metrics.aggregate_heap_metrics(&mut snap);
+        drop(state);
+        snap.finalize();
+        snap
     }
 }
 
