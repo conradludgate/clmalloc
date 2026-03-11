@@ -233,14 +233,23 @@ impl<P: PageAllocator> PagePool<P> {
     /// segment is released back to the OS via munmap. Otherwise, the slab's
     /// physical pages are released via `madvise` so the OS can reclaim them
     /// while keeping the virtual address range available for reuse.
-    // r[impl pool.purge] r[impl pool.purge-free-slab]
+    // r[impl pool.purge] r[impl pool.purge-free-slab] r[impl pool.purge-before-publish]
     #[cold]
     pub fn dealloc_slab(&self, base: NonNull<SlabBase>) {
+        // Purge before making the slab available on the free list.
+        // Another thread could otherwise pop this slab and reinitialize
+        // it before we finish purging, zeroing the new header.
+        // SAFETY: base points to a SLAB_SIZE-aligned, SLAB_SIZE-byte region
+        // within a live mmap'd segment. The slab is fully free; no other
+        // thread can access it since it is not yet on any shared list.
+        unsafe { self.page_alloc.purge(base.cast(), SLAB_SIZE) };
+
         let slab: Link = base.as_ptr().cast();
         let mut state = self.state.lock();
         #[cfg(feature = "metrics")]
         {
             state.metrics.pool_lock_count += 1;
+            state.metrics.slab_purge_count += 1;
         }
         state.free_list.push(slab);
 
@@ -267,15 +276,6 @@ impl<P: PageAllocator> PagePool<P> {
                     Layout::new::<Segment>(),
                 );
             }
-        } else {
-            #[cfg(feature = "metrics")]
-            {
-                state.metrics.slab_purge_count += 1;
-            }
-            drop(state);
-            // SAFETY: base points to a SLAB_SIZE-aligned, SLAB_SIZE-byte region
-            // within a live mmap'd segment.
-            unsafe { self.page_alloc.purge(base.cast(), SLAB_SIZE) };
         }
     }
 

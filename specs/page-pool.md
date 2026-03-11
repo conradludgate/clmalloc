@@ -56,6 +56,13 @@ to the OS via `PageAllocator::purge`. The virtual address range is
 retained so the slab can be reused without a new mmap. This reduces
 RSS when partially-occupied segments prevent full segment munmap.
 
+r[pool.purge-before-publish]
+The pool MUST purge a slab's physical pages BEFORE placing it on the
+free list. If the slab were published first, another thread could pop
+it, reinitialize its header for a new size class, and begin allocating
+from it while the purge is still in flight — zeroing the new header
+and corrupting live metadata.
+
 ## Exhaustion
 
 r[pool.no-panic-under-lock]

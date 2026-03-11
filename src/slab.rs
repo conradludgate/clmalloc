@@ -383,9 +383,11 @@ impl Slab {
     /// Return a slot to the local free list. O(1).
     #[inline]
     pub fn dealloc_local(&mut self, ptr: NonNull<u8>) {
-        self.header().local.with_mut(|p| {
+        let header = self.header();
+        header.local.with_mut(|p| {
             // SAFETY: with_mut provides exclusive access to SlotFreeList.
-            unsafe { &mut *p }.push(ptr);
+            let fl = unsafe { &mut *p };
+            fl.push(ptr);
         });
     }
 
