@@ -319,32 +319,6 @@ impl MetricsSnapshot {
         }
         self.allocated = self.alloc_bytes.saturating_sub(self.free_bytes);
     }
-
-    /// # Errors
-    /// Returns `core::fmt::Error` if writing to the formatter fails.
-    // r[impl metrics.histogram-exposition]
-    pub fn write_histogram(
-        &self,
-        w: &mut dyn core::fmt::Write,
-        name: &str,
-        counts: &[u64; NUM_CLASSES],
-        sum: u64,
-    ) -> core::fmt::Result {
-        use crate::size_class;
-
-        writeln!(w, "# TYPE {name} histogram")?;
-        let mut cumulative = 0u64;
-        for (i, &count) in counts.iter().enumerate() {
-            cumulative += count;
-            let le = size_class::class_size(i);
-            writeln!(w, "{name}_bucket{{le=\"{le}\"}} {cumulative}")?;
-        }
-        cumulative += self.large_alloc_count;
-        writeln!(w, "{name}_bucket{{le=\"+Inf\"}} {cumulative}")?;
-        writeln!(w, "{name}_count {cumulative}")?;
-        writeln!(w, "{name}_sum {sum}")?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -400,30 +374,21 @@ mod tests {
         assert_eq!(snap.allocated, 384);
     }
 
-    // r[verify metrics.histogram-exposition] r[verify metrics.histogram-storage]
+    // r[verify metrics.histogram-storage]
     #[test]
-    fn histogram_cumulative_format() {
+    fn per_class_counters_are_independent() {
         let mut snap = MetricsSnapshot::new();
         snap.class_alloc_count[0] = 5;
         let idx_64 =
             size_class::class_index(core::alloc::Layout::from_size_align(64, 1).unwrap()).unwrap();
         snap.class_alloc_count[idx_64] = 3;
-        snap.large_alloc_count = 1;
 
-        let mut buf = String::new();
-        snap.write_histogram(
-            &mut buf,
-            "alloc_objects",
-            &snap.class_alloc_count,
-            snap.alloc_bytes,
-        )
-        .unwrap();
-
-        assert!(buf.starts_with("# TYPE alloc_objects histogram\n"));
-        assert!(buf.contains("alloc_objects_bucket{le=\"+Inf\"} 9\n"));
-        assert!(buf.contains("alloc_objects_count 9\n"));
-
-        let first_le = size_class::class_size(0);
-        assert!(buf.contains(&format!("alloc_objects_bucket{{le=\"{first_le}\"}} 5\n")));
+        assert_eq!(snap.class_alloc_count[0], 5);
+        assert_eq!(snap.class_alloc_count[idx_64], 3);
+        for i in 0..NUM_CLASSES {
+            if i != 0 && i != idx_64 {
+                assert_eq!(snap.class_alloc_count[i], 0);
+            }
+        }
     }
 }

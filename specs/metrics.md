@@ -5,7 +5,7 @@ to be cheaply maintained (thread-local counters, no locks on the hot path)
 and queryable without stopping the allocator.
 
 Per-size-class counters use size class boundaries as bucket boundaries,
-mapping directly to Prometheus histogram exposition format.
+suitable for Prometheus histogram exposition.
 
 ## Thread-local counters
 
@@ -98,17 +98,7 @@ all heaps).
 r[metrics.histogram-storage]
 Per-size-class counters MUST be stored as independent per-bucket
 values (not cumulative). This avoids multi-bucket atomic updates
-on each allocation. Cumulative `le`-style sums MUST be computed
-at exposition time, not at increment time.
-
-r[metrics.histogram-exposition]
-At exposition time, the allocator MUST produce Prometheus-compatible
-cumulative histogram output from the per-bucket counters by computing
-a rolling sum over size classes in ascending order. Each size class's
-upper bound (the class size) serves as the `le` label value. A `+Inf`
-bucket MUST include large allocations that exceed the maximum size
-class. The `_sum` MUST equal total bytes and `_count` MUST equal
-total objects.
+on each allocation.
 
 ## Cache effectiveness
 

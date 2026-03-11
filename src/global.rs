@@ -128,8 +128,8 @@ mod imp {
 
         // r[impl pprof.activate]
         #[cfg(feature = "pprof")]
-        pub fn set_prof_active(&self, active: bool) {
-            crate::pprof::set_prof_active(active);
+        pub fn set_pprof_config(&self, config: Option<crate::pprof::PprofConfig>) {
+            crate::pprof::set_pprof_config(config);
         }
 
         // r[impl pprof.dump-api]

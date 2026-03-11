@@ -15,14 +15,16 @@ When the feature is disabled, all profiling code MUST be compiled out with
 zero overhead on the allocation fast path.
 
 r[pprof.activate]
-When compiled in, profiling MUST be activatable and deactivatable at
-runtime without restarting the process. The default state (active or
-inactive) MUST be configurable.
+Profiling MUST be activatable and deactivatable at runtime via a single
+configuration call: `set_pprof_config(Option<PprofConfig>)`. Passing
+`Some(config)` activates profiling with the given settings; passing
+`None` deactivates it. The default state MUST be inactive.
 
 r[pprof.sample-interval]
-The sampling interval (mean bytes between samples) MUST be configurable.
-The default SHOULD be 524288 (512 KiB), matching jemalloc's default
-`lg_prof_sample=19`.
+`PprofConfig` MUST include a `sample_interval` field specifying the
+mean bytes between samples. The default SHOULD be 524288 (512 KiB),
+matching jemalloc's default `lg_prof_sample=19`. The interval MUST
+be greater than zero.
 
 ## Sampling
 
@@ -43,6 +45,14 @@ r[pprof.inactive-cost]
 When profiling is compiled in but inactive at runtime, the fast path
 MUST NOT perform the counter decrement. The cost MUST be a single
 branch on a flag (or atomic load).
+
+## Reentrancy
+
+r[pprof.no-reentrant-sample]
+The profiling instrumentation (sample recording, side-table updates,
+stack capture) MUST NOT re-enter the profiling path when its own
+internal allocations trigger the allocator. A thread-local reentrancy
+guard MUST suppress sampling during profiling operations.
 
 ## Stack traces
 

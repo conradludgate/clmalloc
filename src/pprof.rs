@@ -9,6 +9,7 @@
 //! The profile can be dumped as a gzip'd pprof protobuf at any time via
 //! `dump()`.
 
+use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::io::Write;
@@ -22,24 +23,54 @@ use rand::{Rng, RngExt, SeedableRng};
 /// Default sample interval in bytes (512 KiB, matching jemalloc's `lg_prof_sample=19`).
 const DEFAULT_SAMPLE_INTERVAL: u64 = 512 * 1024;
 
+/// Profiling configuration. Pass `Some(PprofConfig)` to activate profiling,
+/// `None` to deactivate.
+#[derive(Clone, Debug)]
+pub struct PprofConfig {
+    /// Mean bytes between samples (Poisson per-byte model).
+    /// Must be > 0. Defaults to 512 KiB.
+    pub sample_interval: u64,
+}
+
+impl Default for PprofConfig {
+    fn default() -> Self {
+        Self {
+            sample_interval: DEFAULT_SAMPLE_INTERVAL,
+        }
+    }
+}
+
 // r[impl pprof.activate]
 static PROF_ACTIVE: AtomicBool = AtomicBool::new(false);
 // r[impl pprof.sample-interval]
 static SAMPLE_INTERVAL: AtomicU64 = AtomicU64::new(DEFAULT_SAMPLE_INTERVAL);
 
-pub fn set_prof_active(active: bool) {
-    PROF_ACTIVE.store(active, Ordering::Release);
-}
-
-pub fn is_prof_active() -> bool {
-    PROF_ACTIVE.load(Ordering::Acquire)
-}
-
+/// Activate (`Some`) or deactivate (`None`) heap profiling.
+///
 /// # Panics
-/// Panics if `bytes` is zero.
-pub fn set_sample_interval(bytes: u64) {
-    assert!(bytes > 0, "sample interval must be > 0");
-    SAMPLE_INTERVAL.store(bytes, Ordering::Release);
+/// Panics if `config.sample_interval` is zero.
+pub fn set_pprof_config(config: Option<PprofConfig>) {
+    match config {
+        Some(c) => {
+            assert!(c.sample_interval > 0, "sample interval must be > 0");
+            SAMPLE_INTERVAL.store(c.sample_interval, Ordering::Release);
+            PROF_ACTIVE.store(true, Ordering::Release);
+        }
+        None => {
+            PROF_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Returns the current profiling configuration, or `None` if inactive.
+pub fn pprof_config() -> Option<PprofConfig> {
+    if PROF_ACTIVE.load(Ordering::Acquire) {
+        Some(PprofConfig {
+            sample_interval: SAMPLE_INTERVAL.load(Ordering::Acquire),
+        })
+    } else {
+        None
+    }
 }
 
 /// Geometric(1/R) sample: ceil(-R * ln(U)) where U is uniform (0,1).
@@ -183,10 +214,42 @@ fn with_state<R>(f: impl FnOnce(&mut PprofState) -> R) -> R {
     f(state)
 }
 
+// -- Reentrancy guard --------------------------------------------------------
+
+// r[impl pprof.no-reentrant-sample]
+thread_local! {
+    static IN_PPROF: Cell<bool> = const { Cell::new(false) };
+}
+
+struct ReentrancyGuard;
+
+impl ReentrancyGuard {
+    fn acquire() -> Option<Self> {
+        if IN_PPROF.replace(true) {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        IN_PPROF.set(false);
+    }
+}
+
 // -- Public instrumentation API ----------------------------------------------
 
 // r[impl pprof.backtrace]
+#[cold]
+#[inline(never)]
+#[track_caller]
 pub(crate) fn record_sample(ptr: *mut u8, size: usize, class_idx: u8) {
+    let Some(_guard) = ReentrancyGuard::acquire() else {
+        return;
+    };
+
     let mut frames = Vec::with_capacity(32);
     backtrace::trace(|frame| {
         frames.push(frame.ip() as usize);
@@ -219,6 +282,10 @@ pub(crate) fn record_sample(ptr: *mut u8, size: usize, class_idx: u8) {
 
 // r[impl pprof.free-decrement]
 pub(crate) fn maybe_remove_sample(ptr: *mut u8) {
+    let Some(_guard) = ReentrancyGuard::acquire() else {
+        return;
+    };
+
     with_state(|state| {
         if let Some(record) = state.side.map.remove(&(ptr as usize)) {
             let interval = SAMPLE_INTERVAL.load(Ordering::Relaxed);
@@ -255,6 +322,11 @@ fn unbiased_weight(size: usize, interval: u64) -> u64 {
 /// # Errors
 /// Returns an error if writing the gzip-compressed protobuf data fails.
 pub fn dump(writer: &mut dyn Write) -> std::io::Result<()> {
+    // Suppress sampling for allocations made during profile serialization.
+    // Without this, build_profile's internal allocations (Vec, HashMap, String)
+    // would try to call record_sample → with_state → deadlock on PPROF mutex.
+    let _guard = ReentrancyGuard::acquire();
+
     let profile_bytes = with_state(|state| build_profile(state));
     let mut encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
     encoder.write_all(&profile_bytes)?;
@@ -273,6 +345,7 @@ fn build_profile(state: &PprofState) -> Vec<u8> {
     let st_count = strings.intern("count");
     let st_bytes = strings.intern("bytes");
     let st_size_class = strings.intern("size_class");
+    let st_space = strings.intern("space");
 
     let mut locations: Vec<(u64, usize)> = Vec::new();
     let mut loc_map: HashMap<usize, u64> = HashMap::new();
@@ -368,10 +441,24 @@ fn build_profile(state: &PprofState) -> Vec<u8> {
         encode_field(&mut profile, 5, &func);
     }
 
-    // string_table (field 9)
+    // string_table (field 6)
     for s in strings.table {
-        encode_bytes_field(&mut profile, 9, s.as_bytes());
+        encode_bytes_field(&mut profile, 6, s.as_bytes());
     }
+
+    // time_nanos (field 9)
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    encode_varint_field(&mut profile, 9, nanos);
+
+    // period_type (field 11): ("space", "bytes")
+    let pt = encode_value_type(st_space as u64, st_bytes as u64);
+    encode_field(&mut profile, 11, &pt);
+
+    // period (field 12): sample interval in bytes
+    let interval = SAMPLE_INTERVAL.load(Ordering::Relaxed);
+    encode_varint_field(&mut profile, 12, interval);
 
     profile
 }
@@ -468,7 +555,7 @@ pub(crate) fn should_sample() -> bool {
 mod tests {
     use super::*;
 
-    /// Pprof tests mutate global statics (`SAMPLE_INTERVAL`, `PROF_ACTIVE`).
+    /// Pprof tests mutate global config via `set_pprof_config`.
     /// Serialize them so parallel test threads don't interfere.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -482,7 +569,9 @@ mod tests {
     #[test]
     fn sampler_triggers_near_interval() {
         let _g = lock_test();
-        set_sample_interval(1024);
+        set_pprof_config(Some(PprofConfig {
+            sample_interval: 1024,
+        }));
         let mut sampler = Sampler::new(42);
         let mut triggers = 0;
         let total_bytes = 1024 * 1000;
@@ -505,7 +594,7 @@ mod tests {
     #[test]
     fn sampler_check_does_not_trigger_every_time() {
         let _g = lock_test();
-        set_sample_interval(DEFAULT_SAMPLE_INTERVAL);
+        set_pprof_config(Some(PprofConfig::default()));
         let mut sampler = Sampler::new(123);
         let mut triggered = false;
         for _ in 0..10 {
@@ -523,17 +612,17 @@ mod tests {
     #[test]
     fn should_sample_reflects_active_flag() {
         let _g = lock_test();
-        set_prof_active(false);
+        set_pprof_config(None);
         assert!(
             !should_sample(),
             "should_sample must return false when inactive"
         );
-        set_prof_active(true);
+        set_pprof_config(Some(PprofConfig::default()));
         assert!(
             should_sample(),
             "should_sample must return true when active"
         );
-        set_prof_active(false);
+        set_pprof_config(None);
     }
 
     // r[verify pprof.live-tracking] r[verify pprof.activate] r[verify pprof.sample-record]
@@ -541,8 +630,7 @@ mod tests {
     #[test]
     fn side_table_tracks_live_samples() {
         let _g = lock_test();
-        set_prof_active(true);
-        set_sample_interval(1);
+        set_pprof_config(Some(PprofConfig { sample_interval: 1 }));
 
         let ptr = 0xDEAD_BEEF as *mut u8;
         record_sample(ptr, 128, 5);
@@ -569,16 +657,17 @@ mod tests {
             assert_eq!(live, 0, "live count should be 0 after free");
         });
 
-        set_prof_active(false);
+        set_pprof_config(None);
     }
 
     // r[verify pprof.dump-api] r[verify pprof.dump-format]
     // r[verify pprof.sample-types] r[verify pprof.class-label]
     #[test]
-    fn dump_produces_valid_gzip() {
+    fn dump_produces_valid_pprof_protobuf() {
+        use pprof::protos::Message;
+
         let _g = lock_test();
-        set_prof_active(true);
-        set_sample_interval(1);
+        set_pprof_config(Some(PprofConfig { sample_interval: 1 }));
 
         let ptr = 0xCAFE_0000 as *mut u8;
         record_sample(ptr, 256, 2);
@@ -586,43 +675,88 @@ mod tests {
         let mut buf = Vec::new();
         dump(&mut buf).unwrap();
 
-        // Verify gzip header.
-        assert!(buf.len() > 2, "dump output too small");
-        assert_eq!(buf[0], 0x1f, "not gzip");
-        assert_eq!(buf[1], 0x8b, "not gzip");
-
-        // Decompress and verify non-empty protobuf.
+        // Decompress.
         let mut decoder = flate2::read::GzDecoder::new(&buf[..]);
         let mut decompressed = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut decompressed).unwrap();
-        assert!(!decompressed.is_empty(), "decompressed profile is empty");
 
-        // The string table is embedded in the protobuf. Verify the four sample
-        // type names and the class label key appear as substrings.
-        let haystack = String::from_utf8_lossy(&decompressed);
-        for expected in [
-            "alloc_objects",
-            "alloc_space",
-            "inuse_objects",
-            "inuse_space",
-            "size_class",
-        ] {
-            assert!(
-                haystack.contains(expected),
-                "protobuf string table missing \"{expected}\""
-            );
+        // Decode as pprof Profile protobuf.
+        let profile = pprof::protos::Profile::decode(decompressed.as_slice())
+            .expect("dump output must be a valid pprof Profile protobuf");
+
+        // string_table[0] must be "".
+        assert_eq!(profile.string_table[0], "");
+
+        // Four sample types: alloc_objects, alloc_space, inuse_objects, inuse_space.
+        let type_names: Vec<&str> = profile
+            .sample_type
+            .iter()
+            .map(|st| profile.string_table[st.ty as usize].as_str())
+            .collect();
+        assert_eq!(
+            type_names,
+            [
+                "alloc_objects",
+                "alloc_space",
+                "inuse_objects",
+                "inuse_space"
+            ]
+        );
+
+        // At least one sample with 4 values.
+        assert!(!profile.sample.is_empty(), "profile should have samples");
+        for sample in &profile.sample {
+            assert_eq!(sample.value.len(), 4, "each sample must have 4 values");
         }
 
+        // Locations and functions should exist.
+        assert!(
+            !profile.location.is_empty(),
+            "profile should have locations"
+        );
+        assert!(
+            !profile.function.is_empty(),
+            "profile should have functions"
+        );
+
+        // At least one sample should have a size_class label.
+        let size_class_key = profile
+            .string_table
+            .iter()
+            .position(|s| s == "size_class")
+            .expect("string table must contain 'size_class'") as i64;
+        let has_class_label = profile
+            .sample
+            .iter()
+            .any(|s| s.label.iter().any(|l| l.key == size_class_key));
+        assert!(
+            has_class_label,
+            "at least one sample should have a size_class label"
+        );
+
+        // time_nanos should be a recent timestamp.
+        assert!(profile.time_nanos > 0, "time_nanos should be set");
+
+        // period_type should be ("space", "bytes").
+        let pt = profile
+            .period_type
+            .as_ref()
+            .expect("period_type should be set");
+        assert_eq!(profile.string_table[pt.ty as usize], "space");
+        assert_eq!(profile.string_table[pt.unit as usize], "bytes");
+
+        // period should match our sample interval.
+        assert_eq!(profile.period, 1, "period should match sample interval");
+
         maybe_remove_sample(ptr);
-        set_prof_active(false);
+        set_pprof_config(None);
     }
 
     // r[verify pprof.backtrace-dedup]
     #[test]
     fn duplicate_stacks_share_id() {
         let _g = lock_test();
-        set_prof_active(true);
-        set_sample_interval(1);
+        set_pprof_config(Some(PprofConfig { sample_interval: 1 }));
 
         let addrs = [0xAAAA_0001usize, 0xAAAA_0002];
         for &addr in &addrs {
@@ -641,7 +775,7 @@ mod tests {
         for &addr in &addrs {
             maybe_remove_sample(addr as *mut u8);
         }
-        set_prof_active(false);
+        set_pprof_config(None);
     }
 
     // r[verify pprof.unbiased-weight]
