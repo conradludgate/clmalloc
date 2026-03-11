@@ -1,16 +1,18 @@
 //! GlobalAlloc implementation wiring the thread-local heap to Rust's
 //! allocator interface.
 //!
-//! Thread-local heap access uses `pthread_key_create` / `pthread_getspecific`
-//! instead of Rust's `thread_local!` macro, because global allocators must
-//! not register Rust TLS destructors (the runtime aborts if they do).
+//! A `Cell<*mut HeapTy>` provides the fast-path pointer (single TLS load).
+//! The Heap itself is allocated via `libc::malloc` so its lifetime is
+//! independent of the TLS block (which macOS may free before pthread
+//! destructors run). A pthread key is registered solely for destructor
+//! callback on thread exit.
 
 #[cfg(unix)]
 mod imp {
     use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::Cell;
     use core::mem::size_of;
     use core::ptr::{self, NonNull};
-    use core::sync::atomic::{AtomicIsize, Ordering};
 
     use crate::heap::Heap;
     use crate::pool::PagePool;
@@ -20,56 +22,47 @@ mod imp {
 
     type HeapTy = Heap<'static, MmapAllocator>;
 
-    /// Sentinel stored via `pthread_setspecific` after the destructor runs,
-    /// preventing heap re-creation during late TLS teardown.
-    const SENTINEL: *mut HeapTy = std::ptr::dangling_mut::<HeapTy>();
+    /// Stored in the HEAP Cell after the destructor runs, preventing
+    /// heap re-creation during late TLS teardown. Distinguished from
+    /// null (which means "not yet initialized").
+    const DESTROYED: *mut HeapTy = ptr::dangling_mut::<HeapTy>();
+
+    thread_local! {
+        /// Fast-path pointer: null = uninit, DESTROYED = torn down,
+        /// otherwise points to heap-allocated Heap.
+        static HEAP: Cell<*mut HeapTy> = const { Cell::new(ptr::null_mut()) };
+    }
 
     // r[impl alloc.no-reentrant-init]
-    /// Atomic key storage: -1 = uninitialized, >= 0 = valid key.
-    /// Using atomics instead of `std::sync::Once` because `Once` may
-    /// internally allocate when parking contending threads, causing
-    /// reentrancy deadlock in the global allocator.
-    static PTHREAD_KEY: AtomicIsize = AtomicIsize::new(-1);
+    /// Lazy pthread key for destructor registration. `spin::Once` spins on
+    /// contention instead of parking, so it never allocates — safe for use
+    /// inside a global allocator.
+    static PTHREAD_KEY: spin::Once<libc::pthread_key_t> = spin::Once::new();
 
     // r[impl alloc.tls-pthread-cleanup]
     unsafe extern "C" fn heap_destructor(ptr: *mut libc::c_void) {
-        let key = PTHREAD_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
-        if !ptr.is_null() && ptr != SENTINEL as *mut libc::c_void {
-            #[cfg(feature = "metrics")]
-            unsafe {
-                let heap = ptr as *const HeapTy;
-                let metrics_ptr = core::cell::UnsafeCell::raw_get(
-                    core::ptr::addr_of!((*heap).metrics),
-                ) as *const _;
-                (*heap).pool().deregister_heap(metrics_ptr);
-            }
-            unsafe { ptr::drop_in_place(ptr as *mut HeapTy) };
-            unsafe { libc::free(ptr) };
+        if ptr.is_null() || ptr == DESTROYED as *mut libc::c_void {
+            return;
         }
-        unsafe { libc::pthread_setspecific(key, SENTINEL as *mut libc::c_void) };
+        #[cfg(feature = "metrics")]
+        unsafe {
+            let heap = ptr as *const HeapTy;
+            let metrics_ptr =
+                core::cell::UnsafeCell::raw_get(core::ptr::addr_of!((*heap).metrics)) as *const _;
+            (*heap).pool().deregister_heap(metrics_ptr);
+        }
+        unsafe { ptr::drop_in_place(ptr as *mut HeapTy) };
+        unsafe { libc::free(ptr) };
+        HEAP.with(|c| c.set(DESTROYED));
     }
 
-    fn get_key() -> libc::pthread_key_t {
-        let k = PTHREAD_KEY.load(Ordering::Acquire);
-        if k >= 0 {
-            return k as libc::pthread_key_t;
-        }
-        init_key()
-    }
-
-    #[cold]
-    fn init_key() -> libc::pthread_key_t {
-        let mut key: libc::pthread_key_t = 0;
-        let ret = unsafe { libc::pthread_key_create(&mut key, Some(heap_destructor)) };
-        assert_eq!(ret, 0, "pthread_key_create failed");
-
-        match PTHREAD_KEY.compare_exchange(-1, key as isize, Ordering::Release, Ordering::Acquire) {
-            Ok(_) => key,
-            Err(existing) => {
-                unsafe { libc::pthread_key_delete(key) };
-                existing as libc::pthread_key_t
-            }
-        }
+    fn ensure_key() -> libc::pthread_key_t {
+        *PTHREAD_KEY.call_once(|| {
+            let mut key: libc::pthread_key_t = 0;
+            let ret = unsafe { libc::pthread_key_create(&mut key, Some(heap_destructor)) };
+            assert_eq!(ret, 0, "pthread_key_create failed");
+            key
+        })
     }
 
     pub struct ClMalloc {
@@ -89,19 +82,10 @@ mod imp {
             }
         }
 
-        // r[impl alloc.thread-local] r[impl alloc.tls-no-destructor]
-        #[inline]
-        fn get_heap(&'static self) -> *mut HeapTy {
-            let key = get_key();
-            let ptr = unsafe { libc::pthread_getspecific(key) } as *mut HeapTy;
-            if ptr.is_null() {
-                return self.init_heap(key);
-            }
-            ptr
-        }
-
+        // r[impl alloc.thread-local]
         #[cold]
-        fn init_heap(&'static self, key: libc::pthread_key_t) -> *mut HeapTy {
+        #[inline(never)]
+        fn init_heap(&'static self) -> *mut HeapTy {
             let ptr = unsafe { libc::malloc(size_of::<HeapTy>()) } as *mut HeapTy;
             if ptr.is_null() {
                 return ptr;
@@ -109,9 +93,10 @@ mod imp {
             unsafe { ptr::write(ptr, Heap::new(&self.pool)) };
             #[cfg(feature = "metrics")]
             self.pool.register_heap(unsafe {
-                core::cell::UnsafeCell::raw_get(core::ptr::addr_of!((*ptr).metrics))
-                    as *const _
+                core::cell::UnsafeCell::raw_get(core::ptr::addr_of!((*ptr).metrics)) as *const _
             });
+            HEAP.with(|c| c.set(ptr));
+            let key = ensure_key();
             unsafe { libc::pthread_setspecific(key, ptr as *mut libc::c_void) };
             ptr
         }
@@ -144,9 +129,15 @@ mod imp {
             }
             // SAFETY: ClMalloc is only used as #[global_allocator] in a static.
             let this: &'static Self = unsafe { &*(self as *const Self) };
-            let heap = this.get_heap();
-            if heap == SENTINEL || heap.is_null() {
+            let mut heap = HEAP.with(|c| c.get());
+            if heap == DESTROYED {
                 return ptr::null_mut();
+            }
+            if heap.is_null() {
+                heap = this.init_heap();
+                if heap.is_null() {
+                    return ptr::null_mut();
+                }
             }
             match unsafe { (*heap).alloc(layout) } {
                 Some(ptr) => ptr.as_ptr(),
@@ -159,14 +150,14 @@ mod imp {
             if layout.size() == 0 {
                 return;
             }
-            // SAFETY: ClMalloc is only used as #[global_allocator] in a static.
-            let this: &'static Self = unsafe { &*(self as *const Self) };
-            let heap = this.get_heap();
-            if heap != SENTINEL && !heap.is_null() {
+            let heap = HEAP.with(|c| c.get());
+            if !heap.is_null() && heap != DESTROYED {
                 unsafe { (*heap).dealloc(NonNull::new_unchecked(ptr), layout) };
                 return;
             }
             // r[impl alloc.post-exit-dealloc]
+            // SAFETY: ClMalloc is only used as #[global_allocator] in a static.
+            let this: &'static Self = unsafe { &*(self as *const Self) };
             if let Some(_idx) = size_class::class_index(layout) {
                 let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr) };
                 slab_ref.dealloc_remote(unsafe { NonNull::new_unchecked(ptr) });

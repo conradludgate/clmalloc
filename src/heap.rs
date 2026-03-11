@@ -884,7 +884,10 @@ mod tests {
         let before = heap.metrics().cache_hit_count[idx].load(Relaxed);
         // Alloc should hit the cache.
         let _recovered = heap.alloc(layout).unwrap();
-        assert_eq!(heap.metrics().cache_hit_count[idx].load(Relaxed), before + 1);
+        assert_eq!(
+            heap.metrics().cache_hit_count[idx].load(Relaxed),
+            before + 1
+        );
     }
 
     // r[verify metrics.large-alloc-count] r[verify metrics.large-alloc-bytes]
@@ -897,7 +900,10 @@ mod tests {
         let ptr = heap.alloc(layout).unwrap();
         use core::sync::atomic::Ordering::Relaxed;
         assert_eq!(heap.metrics().large_alloc_count.load(Relaxed), 1);
-        assert_eq!(heap.metrics().large_alloc_bytes.load(Relaxed), (1 << 20) as u64);
+        assert_eq!(
+            heap.metrics().large_alloc_bytes.load(Relaxed),
+            (1 << 20) as u64
+        );
         unsafe { heap.dealloc(ptr, layout) };
     }
 

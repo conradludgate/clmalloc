@@ -21,7 +21,7 @@ libc = "0.2"
 rand = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
 mimalloc = { version = "0.1.48", optional = true }
 snmalloc-rs = { version = "0.3.8", optional = true }
-spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }
+spin = { version = "0.10", default-features = false, features = ["spin_mutex", "once"] }
 tikv-jemallocator = { version = "0.6.1", optional = true }
 
 [[bench]]
