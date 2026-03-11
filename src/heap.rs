@@ -24,7 +24,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::pool::PagePool;
 use crate::size_class::{self, NUM_CLASSES};
-use crate::slab::{self, SLAB_MASK, Slab, SlabBase, SlabRef};
+use crate::slab::{
+    self, SLAB_MASK, Slab, SlabBase, SlabList, SlabListCursor, SlabRef, slab_list_pop,
+    slab_list_push,
+};
 use crate::sys::PageAllocator;
 
 static NEXT_HEAP_ID: AtomicUsize = AtomicUsize::new(1);
@@ -80,8 +83,8 @@ pub struct Heap<'pool, P: PageAllocator> {
     id: usize,
     bins: [Option<Slab>; NUM_CLASSES],
     // r[impl heap.page-queue]
-    full_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
-    partial_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
+    full_heads: [SlabList; NUM_CLASSES],
+    partial_heads: [SlabList; NUM_CLASSES],
     caches: [FreeCache; NUM_CLASSES],
     #[cfg(feature = "metrics")]
     pub(crate) metrics: core::cell::UnsafeCell<crate::metrics::HeapMetrics>,
@@ -260,11 +263,9 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             // Partial or full — put on the appropriate list so frees
             // to this slab are local (heap_id is ours).
             if slab.free_count() > 0 {
-                slab.set_next_link(self.partial_heads[class_idx]);
-                self.partial_heads[class_idx] = Some(slab.into_raw());
+                slab_list_push(&mut self.partial_heads[class_idx], slab);
             } else {
-                slab.set_next_link(self.full_heads[class_idx]);
-                self.full_heads[class_idx] = Some(slab.into_raw());
+                slab_list_push(&mut self.full_heads[class_idx], slab);
             }
         }
         result
@@ -334,11 +335,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cold]
     #[inline(never)]
     fn try_partial(&mut self, class_idx: usize) -> bool {
-        if let Some(base) = self.partial_heads[class_idx] {
-            // SAFETY: base came from our partial list; slab is valid.
-            let mut slab = unsafe { Slab::from_raw(base) };
-            self.partial_heads[class_idx] = slab.next_link();
-            slab.set_next_link(None);
+        if let Some(slab) = slab_list_pop(&mut self.partial_heads[class_idx]) {
             self.bins[class_idx] = Some(slab);
             true
         } else {
@@ -354,35 +351,32 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cold]
     #[inline(never)]
     fn scan_full_list(&mut self, class_idx: usize) {
-        let mut prev: *mut Option<NonNull<SlabBase>> = &raw mut self.full_heads[class_idx];
-        while let Some(base) = unsafe { *prev } {
+        // SAFETY: pointer to full_heads element; no aliasing access during iteration.
+        let mut cursor = unsafe { SlabListCursor::new(&raw mut self.full_heads[class_idx]) };
+        while let Some(base) = cursor.current() {
             // SAFETY: base came from our full list; slab is valid.
             let mut slab = unsafe { Slab::from_raw(base) };
             if !slab.has_pending_remote() {
-                prev = slab.next_link_mut();
+                cursor.advance(&mut slab);
                 continue;
             }
-            let next = slab.next_link();
             slab.drain_remote();
             if slab.is_fully_free() {
-                // SAFETY: prev points at a valid Option in full_heads.
-                unsafe { *prev = next };
+                cursor.remove_current(&slab);
                 self.pool.dealloc_slab(slab.into_raw());
                 continue;
             }
             if slab.free_count() > 0 {
-                // SAFETY: prev points at a valid Option in full_heads.
-                unsafe { *prev = next };
+                cursor.remove_current(&slab);
                 slab.set_next_link(None);
                 if self.bins[class_idx].is_none() {
                     self.bins[class_idx] = Some(slab);
                 } else {
-                    slab.set_next_link(self.partial_heads[class_idx]);
-                    self.partial_heads[class_idx] = Some(slab.into_raw());
+                    slab_list_push(&mut self.partial_heads[class_idx], slab);
                 }
                 continue;
             }
-            prev = slab.next_link_mut();
+            cursor.advance(&mut slab);
         }
     }
 
@@ -392,21 +386,20 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cold]
     #[inline(never)]
     fn collect_full_list(&mut self, class_idx: usize) {
-        let mut prev: *mut Option<NonNull<SlabBase>> = &raw mut self.full_heads[class_idx];
-        while let Some(base) = unsafe { *prev } {
+        // SAFETY: pointer to full_heads element; no aliasing access during iteration.
+        let mut cursor = unsafe { SlabListCursor::new(&raw mut self.full_heads[class_idx]) };
+        while let Some(base) = cursor.current() {
             // SAFETY: base came from our full list; slab is valid.
             let mut slab = unsafe { Slab::from_raw(base) };
             if slab.has_pending_remote() {
                 slab.drain_remote();
             }
             if slab.is_fully_free() {
-                let next = slab.next_link();
-                // SAFETY: prev points at a valid Option in full_heads.
-                unsafe { *prev = next };
+                cursor.remove_current(&slab);
                 self.pool.dealloc_slab(slab.into_raw());
                 continue;
             }
-            prev = slab.next_link_mut();
+            cursor.advance(&mut slab);
         }
     }
 
@@ -414,9 +407,8 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cold]
     #[inline(never)]
     fn retire_active(&mut self, class_idx: usize) {
-        if let Some(mut slab) = self.bins[class_idx].take() {
-            slab.set_next_link(self.full_heads[class_idx]);
-            self.full_heads[class_idx] = Some(slab.into_raw());
+        if let Some(slab) = self.bins[class_idx].take() {
+            slab_list_push(&mut self.full_heads[class_idx], slab);
         }
     }
 
@@ -527,12 +519,7 @@ impl<P: PageAllocator> Drop for Heap<'_, P> {
             self.retire_slab(idx);
             // Drain both full and partial lists.
             for heads in [&mut self.full_heads, &mut self.partial_heads] {
-                let mut cursor = heads[idx].take();
-                while let Some(base) = cursor {
-                    // SAFETY: base came from our full/partial list; slab is valid.
-                    let mut slab = unsafe { Slab::from_raw(base) };
-                    cursor = slab.next_link();
-                    slab.set_next_link(None);
+                while let Some(mut slab) = slab_list_pop(&mut heads[idx]) {
                     slab.drain_remote();
                     if slab.is_fully_free() {
                         self.pool.dealloc_slab(slab.into_raw());

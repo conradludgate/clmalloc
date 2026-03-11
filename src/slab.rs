@@ -497,6 +497,68 @@ impl SlabRef {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SlabList — intrusive singly-linked list of slabs via next_link
+// ---------------------------------------------------------------------------
+
+pub(crate) type SlabList = Option<NonNull<SlabBase>>;
+
+/// Push a slab onto the head of a slab list, consuming the owner handle.
+pub(crate) fn slab_list_push(head: &mut SlabList, mut slab: Slab) {
+    slab.set_next_link(*head);
+    *head = Some(slab.into_raw());
+}
+
+/// Pop a slab from the head of a slab list, returning the owner handle.
+pub(crate) fn slab_list_pop(head: &mut SlabList) -> Option<Slab> {
+    let base = (*head)?;
+    // SAFETY: base was put into the list via slab_list_push / into_raw.
+    let mut slab = unsafe { Slab::from_raw(base) };
+    *head = slab.next_link();
+    slab.set_next_link(None);
+    Some(slab)
+}
+
+/// Cursor for in-place traversal and removal on a slab chain.
+///
+/// # Safety
+///
+/// The raw pointer `prev` must remain valid and unaliased for the
+/// cursor's lifetime. The caller must not access the list head through
+/// any other path while the cursor is live.
+pub(crate) struct SlabListCursor {
+    prev: *mut SlabList,
+}
+
+impl SlabListCursor {
+    /// # Safety
+    ///
+    /// `head` must point to a valid `SlabList` that remains live and
+    /// unaliased for the lifetime of the cursor.
+    pub unsafe fn new(head: *mut SlabList) -> Self {
+        Self { prev: head }
+    }
+
+    pub fn current(&self) -> Option<NonNull<SlabBase>> {
+        // SAFETY: prev is valid per construction invariant.
+        unsafe { *self.prev }
+    }
+
+    /// Remove the current node from the list and advance to its successor.
+    /// `slab` must be the owner handle for the current node.
+    pub fn remove_current(&mut self, slab: &Slab) {
+        let next = slab.next_link();
+        // SAFETY: prev is valid per construction invariant.
+        unsafe { *self.prev = next };
+    }
+
+    /// Advance past the current node, keeping it in the list.
+    /// `slab` must be the owner handle for the current node.
+    pub fn advance(&mut self, slab: &mut Slab) {
+        self.prev = slab.next_link_mut();
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;

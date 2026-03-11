@@ -13,7 +13,7 @@ use core::mem::{align_of, size_of};
 use core::ptr::{NonNull, null_mut};
 
 use crate::size_class::NUM_CLASSES;
-use crate::slab::{SLAB_SIZE, Slab, SlabBase};
+use crate::slab::{SLAB_SIZE, Slab, SlabBase, SlabList, slab_list_pop, slab_list_push};
 use crate::sys::PageAllocator;
 
 const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
@@ -33,7 +33,7 @@ type Link = *mut SlabPage;
 
 struct PoolState {
     free_head: Link,
-    abandoned_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
+    abandoned_heads: [SlabList; NUM_CLASSES],
     segment_cursor: Link,
     segment_end: Link,
     /// Index into `segments[]` for the segment currently being carved.
@@ -304,7 +304,7 @@ impl<P: PageAllocator> PagePool<P> {
     /// Called during thread exit when a slab still has outstanding allocations.
     /// Another heap can later adopt it via `adopt_slab`.
     #[cold]
-    pub fn abandon_slab(&self, mut slab: Slab) {
+    pub fn abandon_slab(&self, slab: Slab) {
         let class_idx = slab.size_class_index();
         let mut state = self.state.lock();
         #[cfg(feature = "metrics")]
@@ -312,8 +312,7 @@ impl<P: PageAllocator> PagePool<P> {
             state.metrics.pool_lock_count += 1;
             state.metrics.abandon_count[class_idx] += 1;
         }
-        slab.set_next_link(state.abandoned_heads[class_idx]);
-        state.abandoned_heads[class_idx] = Some(slab.into_raw());
+        slab_list_push(&mut state.abandoned_heads[class_idx], slab);
     }
 
     /// Try to adopt an abandoned slab for the given size class.
@@ -327,16 +326,14 @@ impl<P: PageAllocator> PagePool<P> {
         {
             state.metrics.pool_lock_count += 1;
         }
-        let head = state.abandoned_heads[class_idx]?;
+        if state.abandoned_heads[class_idx].is_none() {
+            return None;
+        }
         #[cfg(feature = "metrics")]
         {
             state.metrics.adopt_count[class_idx] += 1;
         }
-        // SAFETY: head is from abandoned_heads; it was obtained from a valid Slab via into_raw.
-        let mut slab = unsafe { Slab::from_raw(head) };
-        state.abandoned_heads[class_idx] = slab.next_link();
-        slab.set_next_link(None);
-        Some(slab)
+        slab_list_pop(&mut state.abandoned_heads[class_idx])
     }
 
     // r[impl pool.large-alloc]
