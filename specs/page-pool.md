@@ -11,12 +11,16 @@ to the slab size boundary (for pointer masking).
 
 r[pool.thread-safe]
 The page pool MUST be safe to access from any thread. It SHOULD use a
-lock-free or low-contention synchronization strategy.
+low-contention lock (e.g. spin lock). Lock-free pop from a shared slab
+cache is not viable due to data races on intrusive next-pointers; this
+is consistent with jemalloc, tcmalloc, and mimalloc which all use locks
+for their shared page/extent caches.
 
 ## OS memory
 
 r[pool.mmap]
-The page pool MUST obtain memory from the OS using mmap (or platform
+The page pool MUST obtain memory from the OS through a pluggable page
+allocator trait. The production implementation MUST use mmap (or platform
 equivalent) with MAP_ANONYMOUS | MAP_PRIVATE.
 
 r[pool.batch-mmap]
