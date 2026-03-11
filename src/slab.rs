@@ -33,7 +33,7 @@ use crate::size_class;
 use crate::sync::{AtomicPtr, Ordering, UnsafeCell};
 
 pub const SLAB_SIZE: usize = 1 << 16; // 64KB
-const SLAB_MASK: usize = !(SLAB_SIZE - 1);
+pub(crate) const SLAB_MASK: usize = !(SLAB_SIZE - 1);
 
 /// Opaque type representing a slab's memory region. Used as a typed pointer
 /// target (`NonNull<SlabBase>`) instead of raw `NonNull<u8>` for slab bases.
@@ -55,7 +55,7 @@ unsafe fn read_next(slot: *mut u8) -> Link {
 }
 
 #[inline(always)]
-unsafe fn write_next(slot: *mut u8, next: Link) {
+pub(crate) unsafe fn write_next(slot: *mut u8, next: Link) {
     unsafe { slot.cast::<Link>().write_unaligned(next) };
 }
 
@@ -264,6 +264,12 @@ impl Slab {
         })
     }
 
+    /// True if the remote free list has pending entries. Cheaper than
+    /// `drain_remote` when we only need to know whether draining is worthwhile.
+    pub fn has_pending_remote(&self) -> bool {
+        !self.header().remote_head.load(Ordering::Relaxed).is_null()
+    }
+
     // r[impl slab.remote-drain]
     /// Atomically drain the remote free list into the local free list.
     ///
@@ -326,8 +332,6 @@ impl SlabRef {
         }
     }
 
-    /// Heap that owns this slab. Immutable after the heap sets it, so safe
-    /// to read from any thread without synchronization.
     #[inline]
     pub fn heap_id(&self) -> usize {
         self.header().heap_id
@@ -367,6 +371,26 @@ impl SlabRef {
             match header.remote_head.compare_exchange_weak(
                 head,
                 slot,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => head = actual,
+            }
+        }
+    }
+
+    /// Push a pre-chained list `[first -> ... -> last]` onto the remote
+    /// free list in a single CAS. Used by the free cache flush to batch
+    /// multiple frees into one atomic operation per slab.
+    pub fn push_chain_remote(&self, first: *mut u8, last: *mut u8) {
+        let header = self.header();
+        let mut head = header.remote_head.load(Ordering::Relaxed);
+        loop {
+            unsafe { write_next(last, head) };
+            match header.remote_head.compare_exchange_weak(
+                head,
+                first,
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {

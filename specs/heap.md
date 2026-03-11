@@ -28,6 +28,20 @@ When the active slab is fully allocated and its remote free list is also
 empty, the heap MUST request a new slab from the global page pool and make
 it the active slab for that size class.
 
+r[heap.dealloc-o1]
+Deallocation MUST be O(1). If the pointer belongs to the active slab for its
+size class, the heap MUST use the local free list (no atomics). Otherwise the
+heap MUST push the pointer into the free cache. The heap MUST NOT walk the
+retired list during deallocation.
+
+r[heap.free-cache]
+The heap MUST maintain a per-size-class free cache that absorbs non-active-slab
+frees without atomic operations. Allocation MUST check the cache before the
+slab. When the cache overflows, it MUST be flushed in batch: own-slab entries
+go to the local free list directly; remote entries are chained per-slab and
+pushed with a single atomic CAS per slab. The cache MUST be flushed before
+thread exit.
+
 ## Cleanup
 
 r[heap.thread-exit]
