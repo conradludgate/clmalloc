@@ -34,6 +34,17 @@ When the slab owning the pointer belongs to a different thread, `dealloc`
 MUST push the pointer onto the slab's atomic remote free list using a
 lock-free compare-and-swap loop.
 
+## Thread-local access
+
+r[alloc.tls-no-destructor]
+The global allocator MUST NOT register Rust thread-local destructors (via
+`thread_local!` with `Drop` types). The Rust runtime aborts if a global
+allocator registers TLS destructors during allocation.
+
+r[alloc.tls-pthread-cleanup]
+Thread-exit cleanup MUST use `pthread_key_create` (or platform equivalent)
+to register a destructor outside Rust's TLS infrastructure.
+
 ## Zero-size allocations
 
 r[alloc.zst]

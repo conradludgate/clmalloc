@@ -66,6 +66,8 @@ struct SlabHeader {
     slot_count: u16,
     slots_offset: u16,
     size_class_index: u8,
+    // r[impl heap.identity]
+    heap_id: usize,
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
     local: UnsafeCell<LocalState>,
     // r[impl slab.remote-freelist]
@@ -73,7 +75,7 @@ struct SlabHeader {
 }
 
 impl SlabHeader {
-    unsafe fn init(base: NonNull<u8>, size_class_index: u8) -> NonNull<SlabHeader> {
+    unsafe fn init(base: NonNull<u8>, size_class_index: u8, heap_id: usize) -> NonNull<SlabHeader> {
         let slot_size = size_class::class_size(size_class_index as usize);
         debug_assert!(slot_size >= size_of::<Link>());
 
@@ -99,6 +101,7 @@ impl SlabHeader {
                     slot_count: slot_count as u16,
                     slots_offset: slots_offset as u16,
                     size_class_index,
+                    heap_id,
                     local: UnsafeCell::new(LocalState {
                         head: prev,
                         free_count: slot_count as u16,
@@ -144,8 +147,8 @@ impl Slab {
     /// - `base` must be `SLAB_SIZE`-aligned, pointing to `SLAB_SIZE` bytes of
     ///   valid, writable memory.
     /// - No concurrent access to the region during init.
-    pub unsafe fn init(base: NonNull<u8>, size_class_index: u8) -> Slab {
-        let header = unsafe { SlabHeader::init(base, size_class_index) };
+    pub unsafe fn init(base: NonNull<u8>, size_class_index: u8, heap_id: usize) -> Slab {
+        let header = unsafe { SlabHeader::init(base, size_class_index, heap_id) };
         Slab { header }
     }
 
@@ -282,6 +285,17 @@ impl SlabRef {
         }
     }
 
+    /// Heap that owns this slab. Immutable after the heap sets it, so safe
+    /// to read from any thread without synchronization.
+    pub fn heap_id(&self) -> usize {
+        self.header().heap_id
+    }
+
+    /// True if two `SlabRef`s point to the same slab header.
+    pub fn header_eq(&self, other: &SlabRef) -> bool {
+        self.header == other.header
+    }
+
     pub fn slot_size(&self) -> usize {
         self.header().slot_size as usize
     }
@@ -336,7 +350,7 @@ mod tests {
                 let p = alloc_zeroed(layout);
                 NonNull::new(p).expect("aligned alloc failed")
             };
-            let slab = unsafe { Slab::init(ptr, size_class_index) };
+            let slab = unsafe { Slab::init(ptr, size_class_index, 0) };
             Self { slab, ptr, layout }
         }
     }
@@ -533,7 +547,7 @@ mod tests {
             let p = alloc_zeroed(layout);
             NonNull::new(p).expect("aligned alloc failed")
         };
-        let slab = unsafe { Slab::init(base, 0) };
+        let slab = unsafe { Slab::init(base, 0, 0) };
         let returned = slab.into_raw();
         assert_eq!(returned, base);
         unsafe { dealloc(returned.as_ptr(), layout) };
@@ -552,7 +566,7 @@ mod loom_tests {
             let p = std::alloc::alloc_zeroed(layout);
             NonNull::new(p).expect("aligned alloc failed")
         };
-        let mut slab = unsafe { Slab::init(base, size_class_index) };
+        let mut slab = unsafe { Slab::init(base, size_class_index, 0) };
         f(&mut slab);
         drop(slab);
         unsafe {
