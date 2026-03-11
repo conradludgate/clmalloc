@@ -336,7 +336,7 @@ impl Slab {
     pub fn free_count(&self) -> u16 {
         let header = self.header();
         // SAFETY: with_mut provides exclusive access to SlotFreeList.
-        header.local.with_mut(|p| unsafe { (*p).len }) + header.bump_remaining
+        header.local.with_mut(|p| unsafe { (*p).len() }) + header.bump_remaining
     }
 
     // r[impl slab.return-to-pool]
@@ -485,14 +485,14 @@ impl SlabRef {
 
     // r[impl slab.remote-freelist]
     /// Push a freed slot onto the remote free list via atomic CAS.
-    pub fn dealloc_remote(&self, ptr: NonNull<u8>) {
+    pub fn dealloc_remote(self, ptr: NonNull<u8>) {
         self.header().remote.push(ptr);
     }
 
     /// Push a pre-chained list `[first -> ... -> last]` onto the remote
     /// free list in a single CAS. Used by the free cache flush to batch
     /// multiple frees into one atomic operation per slab.
-    pub fn push_chain_remote(&self, first: NonNull<u8>, last: NonNull<u8>) {
+    pub fn push_chain_remote(self, first: NonNull<u8>, last: NonNull<u8>) {
         self.header().remote.push_chain(first, last);
     }
 }

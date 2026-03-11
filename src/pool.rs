@@ -40,6 +40,7 @@ struct PageFreeList {
 impl PageFreeList {
     const EMPTY: Self = Self { head: null_mut() };
 
+    #[expect(dead_code)]
     fn is_empty(&self) -> bool {
         self.head.is_null()
     }
