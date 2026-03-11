@@ -1,0 +1,32 @@
+---
+description: Code comment guidelines
+alwaysApply: true
+---
+# Proxy Code Comments
+
+## Principles
+
+1. **Why over what.** Explain rationale, constraints, trade-offs. Don't restate what the code does.
+2. **Preserve existing comments.** Don't rewrite pre-existing comments unless factually wrong. Add new "why" context alongside, not replacing.
+3. **Concise and high-signal.** One good sentence beats three mediocre ones.
+4. **Ask the author.** When the "why" isn't discoverable, compile a numbered list of questions and ask rather than guessing.
+
+## Do Write
+
+- Module-level docs explaining purpose and architecture (preserve ASCII art diagrams)
+- Why a type exists when the name alone doesn't convey it
+- Non-obvious constraints, security rationale, compatibility notes
+- "Why not" explanations (e.g., deliberate omissions)
+
+## Don't Write
+
+- Field-level comments that restate the type (`/// The timeout` on `timeout: Duration`)
+- Function docs that restate the signature (`/// Returns the user info` on `fn get_user_info()`)
+- Step-by-step narration of what the code does
+- Comments that just say "TODO" or "added for X"
+
+## Example
+
+Good: `/// TCP connect address. May differ from server_name which is used for TLS certificate validation (e.g. a *.databricks.com name).`
+
+Bad: `/// The address to dial when connecting.`

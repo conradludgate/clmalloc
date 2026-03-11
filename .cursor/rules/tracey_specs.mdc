@@ -1,0 +1,159 @@
+---
+description: Guidelines for writing and maintaining Tracey specification files
+alwaysApply: true
+---
+# Tracey Specification Workflow
+
+Tracey is a specification traceability tool. Specs define rules using `r[rule.id]`
+syntax. Source code links back with `// r[impl rule.id]` and `// r[verify rule.id]`
+annotations. Tracey detects orphaned impls, unimplemented rules, and untested rules.
+
+## File Layout
+
+- Spec files live in `specs/*.md` (one file per concern).
+- Tracey config: `.config/tracey/config.styx`.
+- Impl annotations go in source files under `crates/**/src/**/*.rs`.
+- Verify annotations go in test files (unit tests in `crates/**/src/**/*.rs`,
+  integration tests in `crates/**/tests/**/*.rs`).
+
+## Rule ID Conventions
+
+Use short noun prefixes: `client`, `event`, `flush`, `chain`, `hlc`, `moq`,
+`relay`, `backfill`, `auth`, `region`.
+
+IDs use dot-separated levels with no depth limit. Use as many levels as
+needed to be unambiguous, but keep each segment short.
+
+```
+r[chain.write.tail-ack]           ← good: short, specific
+r[auth.jwt.alg.rs256]             ← good: deeper nesting for natural grouping
+r[chain-replication.write.ack]    ← bad: use chain, not chain-replication
+r[chain.replication]              ← bad: too vague, needs a detail level
+```
+
+## Writing Rules
+
+### Granularity: one rule per observable behavior
+
+Each rule describes exactly one observable behavior — one input/output pair,
+one error condition, one state transition. Never bundle multiple independent
+behaviors into a single rule.
+
+```markdown
+r[chain.write.tail-ack]
+The tail node MUST append the event to its local log and then send an
+acknowledgment back to the head.
+```
+
+Not:
+
+```markdown
+r[chain.write]
+The chain replication protocol forwards events between nodes, fsyncs
+them to disk, and sends acknowledgments.
+```
+
+### RFC 2119 keywords
+
+Use strict RFC 2119 semantics: MUST, MUST NOT, SHOULD, SHOULD NOT, MAY.
+Every rule contains at least one keyword. Be precise about what is required
+vs optional.
+
+### Spec hierarchy: leaf-level rules only
+
+Specs define leaf-level rules. If a higher-level spec (e.g. `relay.md`)
+references a concept covered in detail by a lower-level spec (e.g. `chain.md`),
+the higher-level spec should contain a single rule pointing to the lower-level
+spec rather than duplicating rules.
+
+When existing overlap is found, prefer consolidating into the more specific spec.
+
+### Error and fault coverage
+
+Domain specs define their specific error and fault conditions: which failure
+modes exist, what triggers them, and how the system recovers. Each distinct
+failure path gets its own rule.
+
+### Every user-visible error outcome gets a rule
+
+For error/failure paths, write one rule per distinct user-visible outcome
+or recovery behavior.
+
+```markdown
+r[chain.fault.mid-chain-failure]
+If a chain member fails after the head has forwarded the event but before
+the tail ack is received, the head MUST retry with a newly formed chain.
+```
+
+### Implementation-detail rules
+
+Rules about internal implementation choices (constant-time comparison,
+sharded maps, thread pool fairness) are allowed when they matter for
+correctness or security. Accept that these may only have `r[impl]`
+annotations and no `r[verify]`.
+
+### Configuration rules
+
+Security/correctness-relevant configuration parameters (token TTLs, retry
+limits, rate limit thresholds) SHOULD have their own rules specifying the
+parameter and its default. Cosmetic or purely operational configs do not
+need rules.
+
+## When to Create a New Spec
+
+Create a new spec file when introducing a distinct concern — not per Rust
+module, but per conceptual boundary. Ask: "would a developer need to
+understand this as a self-contained unit?"
+
+Examples of good spec boundaries: chain replication, MoQ integration,
+HLC ordering, Postgres flush pipeline, backfill API.
+
+Split an existing spec when it exceeds ~50 rules or covers two clearly
+separable concerns.
+
+## Annotation Format
+
+### Impl annotations
+
+Place `// r[impl rule.id]` on or immediately above the line(s) that
+implement the rule. Multiple rule IDs can share one comment:
+
+```rust
+// r[impl chain.write.head-append] r[impl chain.write.fsync]
+async fn replicate(&self, event: Event) -> Result<()> {
+```
+
+### Verify annotations
+
+Place `// r[verify rule.id]` on or immediately above the test function:
+
+```rust
+// r[verify chain.write.tail-ack]
+#[tokio::test]
+async fn test_chain_tail_ack() {
+```
+
+### Placement rules
+
+- Annotate the most specific code location, not a whole file or module.
+- Prefer annotating the function/match-arm/branch that implements the behavior.
+- One annotation per behavior, even if the code touches multiple rules.
+  Put multiple `r[impl ...]` on the same line when they share a code path.
+
+## Coverage Checks
+
+Count coverage per spec:
+
+```bash
+# rules defined
+rg -c '^r\[' specs/SPEC.md
+
+# impl annotations
+rg 'r\[impl PREFIX\.' crates/ | wc -l
+
+# verify annotations
+rg 'r\[verify PREFIX\.' crates/ | wc -l
+```
+
+Target: every rule has at least one `r[impl]`. Every rule that describes
+externally observable behavior should have at least one `r[verify]`.
