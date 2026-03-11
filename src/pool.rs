@@ -31,8 +31,51 @@ const _: () = assert!(align_of::<Segment>() == SLAB_SIZE);
 
 type Link = *mut SlabPage;
 
+/// Free list of slab pages. Each free page stores a next-pointer in its
+/// first pointer-sized bytes (always aligned since SlabPage is 64KB-aligned).
+struct PageFreeList {
+    head: Link,
+}
+
+impl PageFreeList {
+    const EMPTY: Self = Self { head: null_mut() };
+
+    fn is_empty(&self) -> bool {
+        self.head.is_null()
+    }
+
+    fn push(&mut self, slab: Link) {
+        // SAFETY: slab is a valid SLAB_SIZE-aligned page; first word holds the link.
+        unsafe { slab.cast::<Link>().write(self.head) };
+        self.head = slab;
+    }
+
+    fn pop(&mut self) -> Option<NonNull<SlabPage>> {
+        let slab = NonNull::new(self.head)?;
+        // SAFETY: slab is from our free list; first word holds the next link.
+        self.head = unsafe { slab.as_ptr().cast::<Link>().read() };
+        Some(slab)
+    }
+
+    /// Remove all nodes where `pred` returns true.
+    fn remove_if(&mut self, mut pred: impl FnMut(Link) -> bool) {
+        let mut prev: *mut Link = &raw mut self.head;
+        // SAFETY: prev points at head or at a slab's link field; all are valid.
+        unsafe {
+            while !(*prev).is_null() {
+                let slab = *prev;
+                if pred(slab) {
+                    *prev = slab.cast::<Link>().read();
+                } else {
+                    prev = slab.cast::<Link>();
+                }
+            }
+        }
+    }
+}
+
 struct PoolState {
-    free_head: Link,
+    free_list: PageFreeList,
     abandoned_heads: [SlabList; NUM_CLASSES],
     segment_cursor: Link,
     segment_end: Link,
@@ -71,7 +114,7 @@ impl<P: PageAllocator> PagePool<P> {
         Self {
             page_alloc,
             state: spin::Mutex::new(PoolState {
-                free_head: null_mut::<SlabPage>(),
+                free_list: PageFreeList::EMPTY,
                 abandoned_heads: [None; NUM_CLASSES],
                 segment_cursor: null_mut::<SlabPage>(),
                 segment_end: null_mut::<SlabPage>(),
@@ -103,18 +146,14 @@ impl<P: PageAllocator> PagePool<P> {
             state.metrics.pool_lock_count += 1;
         }
 
-        if !state.free_head.is_null() {
-            let slab = state.free_head;
-            // SAFETY: slab is from the free list; each slab's first word holds the next link.
-            state.free_head = unsafe { slab.cast::<Link>().read() };
-            let seg = Self::find_segment(&state, slab as usize);
+        if let Some(slab) = state.free_list.pop() {
+            let seg = Self::find_segment(&state, slab.as_ptr() as usize);
             state.seg_outstanding[seg] += 1;
             #[cfg(feature = "metrics")]
             {
                 state.outstanding_slabs += 1;
             }
-            // SAFETY: slab is non-null (we checked free_head above).
-            return Some(unsafe { NonNull::new_unchecked(slab.cast()) });
+            return Some(slab.cast());
         }
 
         if state.segment_cursor < state.segment_end {
@@ -171,9 +210,7 @@ impl<P: PageAllocator> PagePool<P> {
             for i in (1..SLABS_PER_SEGMENT).rev() {
                 // SAFETY: i in 1..SLABS_PER_SEGMENT, segment has SLABS_PER_SEGMENT slabs.
                 let slab = unsafe { seg_base.add(i) };
-                // SAFETY: slab is within segment; first word holds the link.
-                unsafe { slab.cast::<Link>().write(state.free_head) };
-                state.free_head = slab;
+                state.free_list.push(slab);
             }
         } else {
             state.carving_idx = seg_idx;
@@ -202,9 +239,7 @@ impl<P: PageAllocator> PagePool<P> {
         {
             state.metrics.pool_lock_count += 1;
         }
-        // SAFETY: slab is from the pool; first word holds the link.
-        unsafe { slab.cast::<Link>().write(state.free_head) };
-        state.free_head = slab;
+        state.free_list.push(slab);
 
         let seg = Self::find_segment(&state, slab as usize);
         state.seg_outstanding[seg] -= 1;
@@ -264,19 +299,10 @@ impl<P: PageAllocator> PagePool<P> {
     /// Walk the free list and unlink all slabs belonging to the given segment.
     fn remove_segment_slabs(state: &mut PoolState, seg_base: usize) {
         let seg_end = seg_base + SEGMENT_SIZE;
-        let mut prev: *mut Link = &raw mut state.free_head;
-        // SAFETY: prev points at free_head or at a slab's link field; slabs are from mmap and valid.
-        unsafe {
-            while !(*prev).is_null() {
-                let slab = *prev;
-                let addr = slab as usize;
-                if addr >= seg_base && addr < seg_end {
-                    *prev = slab.cast::<Link>().read();
-                } else {
-                    prev = slab.cast::<Link>();
-                }
-            }
-        }
+        state.free_list.remove_if(|slab| {
+            let addr = slab as usize;
+            addr >= seg_base && addr < seg_end
+        });
     }
 
     /// Swap-remove a segment from all tracking arrays.
