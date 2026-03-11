@@ -32,7 +32,7 @@ const _: () = assert!(align_of::<Segment>() == SLAB_SIZE);
 type Link = *mut SlabPage;
 
 /// Free list of slab pages. Each free page stores a next-pointer in its
-/// first pointer-sized bytes (always aligned since SlabPage is 64KB-aligned).
+/// first pointer-sized bytes (always aligned since `SlabPage` is 64KB-aligned).
 struct PageFreeList {
     head: Link,
 }
@@ -59,15 +59,15 @@ impl PageFreeList {
 
     /// Remove all nodes where `pred` returns true.
     fn remove_if(&mut self, mut pred: impl FnMut(Link) -> bool) {
-        let mut prev: *mut Link = &raw mut self.head;
+        let mut cursor: *mut Link = &raw mut self.head;
         // SAFETY: prev points at head or at a slab's link field; all are valid.
         unsafe {
-            while !(*prev).is_null() {
-                let slab = *prev;
+            while !(*cursor).is_null() {
+                let slab = *cursor;
                 if pred(slab) {
-                    *prev = slab.cast::<Link>().read();
+                    *cursor = slab.cast::<Link>().read();
                 } else {
-                    prev = slab.cast::<Link>();
+                    cursor = slab.cast::<Link>();
                 }
             }
         }
@@ -352,9 +352,7 @@ impl<P: PageAllocator> PagePool<P> {
         {
             state.metrics.pool_lock_count += 1;
         }
-        if state.abandoned_heads[class_idx].is_none() {
-            return None;
-        }
+        state.abandoned_heads[class_idx]?;
         #[cfg(feature = "metrics")]
         {
             state.metrics.adopt_count[class_idx] += 1;
