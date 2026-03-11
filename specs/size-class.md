@@ -27,7 +27,7 @@ giving a 1.25x growth factor).
 
 r[size-class.medium]
 Size classes from 1024 bytes up to 32768 bytes SHOULD use a spacing that
-wastes at most 12.5% per allocation.
+wastes at most 25% per allocation.
 
 r[size-class.large]
 Allocations larger than the maximum size class MUST be satisfied by
