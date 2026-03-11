@@ -88,6 +88,7 @@ pub struct Heap<'pool, P: PageAllocator> {
     caches: [FreeCache; NUM_CLASSES],
     #[cfg(feature = "metrics")]
     pub(crate) metrics: core::cell::UnsafeCell<crate::metrics::HeapMetrics>,
+    // r[impl pprof.feature-gate]
     #[cfg(feature = "pprof")]
     sampler: crate::pprof::Sampler,
 }
@@ -630,6 +631,62 @@ mod tests {
         }
     }
 
+    // r[verify heap.page-queue]
+    #[test]
+    fn full_queue_scan_promotes_partial() {
+        let pool = Arc::new(pool());
+        let mut heap = Heap::new(&pool);
+        let layout = Layout::from_size_align(64, 1).unwrap();
+
+        // Fill slab 1 completely → moves to full queue.
+        let first_ptr = heap.alloc(layout).unwrap();
+        let first_slab = unsafe { SlabRef::from_interior_ptr(first_ptr.as_ptr()) };
+        let slot_count = first_slab.slot_count();
+        let mut slab1_ptrs = vec![first_ptr];
+        for _ in 1..slot_count {
+            slab1_ptrs.push(heap.alloc(layout).unwrap());
+        }
+
+        // Slab 2 becomes active.
+        let slab2_ptr = heap.alloc(layout).unwrap();
+        let slab2 = unsafe { SlabRef::from_interior_ptr(slab2_ptr.as_ptr()) };
+        assert!(!first_slab.header_eq(slab2));
+
+        // Remote-free one slot from slab 1 (via another thread).
+        let remote_raw = slab1_ptrs.pop().unwrap().as_ptr() as usize;
+        std::thread::spawn(move || {
+            let ptr = NonNull::new(remote_raw as *mut u8).unwrap();
+            let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
+            slab_ref.dealloc_remote(ptr);
+        })
+        .join()
+        .unwrap();
+
+        // Fill slab 2 completely → moves to full queue.
+        let mut slab2_ptrs = vec![slab2_ptr];
+        for _ in 1..slot_count {
+            slab2_ptrs.push(heap.alloc(layout).unwrap());
+        }
+
+        // Next alloc: no active slab, cache empty, partial queue empty.
+        // scan_full_list drains slab 1's remote free → slab 1 becomes partial
+        // → promoted to active → alloc succeeds from slab 1.
+        let recovered = heap.alloc(layout).unwrap();
+        let recovered_slab = unsafe { SlabRef::from_interior_ptr(recovered.as_ptr()) };
+        assert!(
+            first_slab.header_eq(recovered_slab),
+            "should allocate from promoted slab 1, not a new slab"
+        );
+
+        unsafe { heap.dealloc(recovered, layout) };
+        for ptr in slab1_ptrs {
+            unsafe { heap.dealloc(ptr, layout) };
+        }
+        for ptr in slab2_ptrs {
+            unsafe { heap.dealloc(ptr, layout) };
+        }
+    }
+
     #[test]
     fn large_allocation_passthrough() {
         let pool = pool();
@@ -640,7 +697,7 @@ mod tests {
         unsafe { heap.dealloc(ptr, layout) };
     }
 
-    // r[verify heap.thread-exit]
+    // r[verify heap.thread-exit] r[verify slab.return-to-pool]
     #[test]
     fn drop_returns_free_slabs_to_pool() {
         let pool = pool();
@@ -915,6 +972,7 @@ mod tests {
     }
 
     // r[verify metrics.large-alloc-count] r[verify metrics.large-alloc-bytes]
+    // r[verify metrics.large-dealloc-bytes]
     #[cfg(feature = "metrics")]
     #[test]
     fn metrics_large_alloc_tracked() {
@@ -930,12 +988,19 @@ mod tests {
             (1 << 20) as u64
         );
         unsafe { heap.dealloc(ptr, layout) };
+        assert_eq!(
+            heap.metrics().large_dealloc_bytes.load(Relaxed),
+            (1 << 20) as u64
+        );
     }
 
-    // r[verify metrics.global-snapshot]
+    // r[verify metrics.global-snapshot] r[verify metrics.global-allocated]
+    // r[verify metrics.global-active] r[verify metrics.global-mapped]
     #[cfg(feature = "metrics")]
     #[test]
     fn snapshot_aggregates_registered_heaps() {
+        use crate::slab::SLAB_SIZE;
+
         let pool = pool();
         let mut h1 = Heap::new(&pool);
         let mut h2 = Heap::new(&pool);
@@ -953,12 +1018,130 @@ mod tests {
         let snap = pool.snapshot();
         assert_eq!(snap.class_alloc_count[idx], 2);
         assert_eq!(snap.alloc_bytes, 2 * cs);
+        assert_eq!(snap.allocated, 2 * cs);
         assert_eq!(snap.class_live_count[idx], 2);
+        // Each heap has 1 outstanding slab, so active >= 2 * SLAB_SIZE.
+        assert!(snap.active >= 2 * SLAB_SIZE as u64);
+        // Mapped must include at least one segment.
+        assert!(snap.mapped >= crate::pool::SEGMENT_SIZE as u64);
 
         unsafe { h1.dealloc(p1, layout) };
         unsafe { h2.dealloc(p2, layout) };
 
         pool.deregister_heap(h1.metrics.get().cast_const());
         pool.deregister_heap(h2.metrics.get().cast_const());
+    }
+
+    // r[verify metrics.cache-flush-count]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_cache_flush_counted() {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        let pool = pool();
+        let mut heap = Heap::new(&pool);
+        let layout = Layout::from_size_align(64, 1).unwrap();
+        let idx = size_class::class_index(layout).unwrap();
+
+        let first_ptr = heap.alloc(layout).unwrap();
+        let first_slab = unsafe { SlabRef::from_interior_ptr(first_ptr.as_ptr()) };
+        let slot_count = first_slab.slot_count();
+        let mut first_ptrs = vec![first_ptr];
+        for _ in 1..slot_count {
+            first_ptrs.push(heap.alloc(layout).unwrap());
+        }
+        let _second_ptr = heap.alloc(layout).unwrap();
+
+        // Fill the cache (CACHE_CAP entries), then one more to trigger flush.
+        for _ in 0..=CACHE_CAP {
+            let cached = first_ptrs.pop().unwrap();
+            unsafe { heap.dealloc(cached, layout) };
+        }
+
+        assert!(heap.metrics().cache_flush_count[idx].load(Relaxed) > 0);
+    }
+
+    // r[verify metrics.segment-munmap-count]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_segment_munmap_counted() {
+        use crate::slab::SLAB_SIZE;
+        let pool = pool();
+
+        let slabs_per_seg = crate::pool::SEGMENT_SIZE / SLAB_SIZE;
+        let mut slabs = Vec::new();
+        for _ in 0..slabs_per_seg {
+            slabs.push(pool.alloc_slab().unwrap());
+        }
+        for slab in slabs {
+            pool.dealloc_slab(slab);
+        }
+
+        let snap = pool.snapshot();
+        assert!(snap.segment_munmap_count > 0);
+    }
+
+    // r[verify metrics.abandon-count] r[verify metrics.adopt-count]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_abandon_adopt_counted() {
+        let pool = pool();
+        let layout = Layout::from_size_align(64, 1).unwrap();
+        let idx = size_class::class_index(layout).unwrap();
+
+        let outstanding;
+        {
+            let mut heap1 = Heap::new(&pool);
+            outstanding = heap1.alloc(layout).unwrap();
+        }
+        {
+            let snap = pool.snapshot();
+            assert!(snap.abandon_count[idx] > 0);
+        }
+
+        let mut heap2 = Heap::new(&pool);
+        let _ptr = heap2.alloc(layout).unwrap();
+        {
+            let snap = pool.snapshot();
+            assert!(snap.adopt_count[idx] > 0);
+        }
+
+        unsafe { heap2.dealloc(outstanding, layout) };
+    }
+
+    // r[verify metrics.thread-active-bytes]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_active_bytes_tracked() {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        let pool = pool();
+        let mut heap = Heap::new(&pool);
+        let layout = Layout::from_size_align(64, 1).unwrap();
+        let cs = size_class::class_size(size_class::class_index(layout).unwrap()) as u64;
+
+        let ptr = heap.alloc(layout).unwrap();
+        assert_eq!(heap.metrics().alloc_bytes.load(Relaxed), cs);
+        assert_eq!(heap.metrics().free_bytes.load(Relaxed), 0);
+
+        unsafe { heap.dealloc(ptr, layout) };
+        assert_eq!(heap.metrics().free_bytes.load(Relaxed), cs);
+    }
+
+    // r[verify metrics.pool-lock-count] r[verify metrics.segment-mmap-count]
+    // r[verify metrics.slab-purge-count]
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_pool_counters() {
+        let pool = pool();
+
+        // Alloc and free a slab directly to exercise pool-level metrics.
+        let slab = pool.alloc_slab().unwrap();
+        pool.dealloc_slab(slab);
+
+        let snap = pool.snapshot();
+        assert!(snap.pool_lock_count > 0);
+        assert!(snap.segment_mmap_count > 0);
+        assert!(snap.slab_purge_count > 0);
     }
 }

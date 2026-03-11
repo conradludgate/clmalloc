@@ -468,9 +468,20 @@ pub(crate) fn should_sample() -> bool {
 mod tests {
     use super::*;
 
-    // r[verify pprof.geometric-sampling]
+    /// Pprof tests mutate global statics (`SAMPLE_INTERVAL`, `PROF_ACTIVE`).
+    /// Serialize them so parallel test threads don't interfere.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_test() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // r[verify pprof.geometric-sampling] r[verify pprof.sample-interval]
     #[test]
     fn sampler_triggers_near_interval() {
+        let _g = lock_test();
         set_sample_interval(1024);
         let mut sampler = Sampler::new(42);
         let mut triggers = 0;
@@ -493,6 +504,7 @@ mod tests {
     // r[verify pprof.fast-path-cost]
     #[test]
     fn sampler_check_does_not_trigger_every_time() {
+        let _g = lock_test();
         set_sample_interval(DEFAULT_SAMPLE_INTERVAL);
         let mut sampler = Sampler::new(123);
         let mut triggered = false;
@@ -507,9 +519,28 @@ mod tests {
         );
     }
 
-    // r[verify pprof.live-tracking]
+    // r[verify pprof.inactive-cost]
+    #[test]
+    fn should_sample_reflects_active_flag() {
+        let _g = lock_test();
+        set_prof_active(false);
+        assert!(
+            !should_sample(),
+            "should_sample must return false when inactive"
+        );
+        set_prof_active(true);
+        assert!(
+            should_sample(),
+            "should_sample must return true when active"
+        );
+        set_prof_active(false);
+    }
+
+    // r[verify pprof.live-tracking] r[verify pprof.activate] r[verify pprof.sample-record]
+    // r[verify pprof.free-decrement] r[verify pprof.backtrace]
     #[test]
     fn side_table_tracks_live_samples() {
+        let _g = lock_test();
         set_prof_active(true);
         set_sample_interval(1);
 
@@ -541,8 +572,11 @@ mod tests {
         set_prof_active(false);
     }
 
+    // r[verify pprof.dump-api] r[verify pprof.dump-format]
+    // r[verify pprof.sample-types] r[verify pprof.class-label]
     #[test]
     fn dump_produces_valid_gzip() {
+        let _g = lock_test();
         set_prof_active(true);
         set_sample_interval(1);
 
@@ -563,10 +597,54 @@ mod tests {
         std::io::Read::read_to_end(&mut decoder, &mut decompressed).unwrap();
         assert!(!decompressed.is_empty(), "decompressed profile is empty");
 
+        // The string table is embedded in the protobuf. Verify the four sample
+        // type names and the class label key appear as substrings.
+        let haystack = String::from_utf8_lossy(&decompressed);
+        for expected in [
+            "alloc_objects",
+            "alloc_space",
+            "inuse_objects",
+            "inuse_space",
+            "size_class",
+        ] {
+            assert!(
+                haystack.contains(expected),
+                "protobuf string table missing \"{expected}\""
+            );
+        }
+
         maybe_remove_sample(ptr);
         set_prof_active(false);
     }
 
+    // r[verify pprof.backtrace-dedup]
+    #[test]
+    fn duplicate_stacks_share_id() {
+        let _g = lock_test();
+        set_prof_active(true);
+        set_sample_interval(1);
+
+        let addrs = [0xAAAA_0001usize, 0xAAAA_0002];
+        for &addr in &addrs {
+            record_sample(addr as *mut u8, 64, 0);
+        }
+
+        with_state(|state| {
+            let r1 = state.side.map.get(&addrs[0]).unwrap();
+            let r2 = state.side.map.get(&addrs[1]).unwrap();
+            assert_eq!(
+                r1.stack_id, r2.stack_id,
+                "samples from same call site must share a deduped stack ID"
+            );
+        });
+
+        for &addr in &addrs {
+            maybe_remove_sample(addr as *mut u8);
+        }
+        set_prof_active(false);
+    }
+
+    // r[verify pprof.unbiased-weight]
     #[test]
     fn unbiased_weight_converges() {
         // For size == interval, weight should be ~1/(1-e^{-1}) ≈ 1.58 → rounds to 2.

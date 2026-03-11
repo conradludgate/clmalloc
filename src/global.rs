@@ -27,9 +27,11 @@ mod imp {
     /// null (which means "not yet initialized").
     const DESTROYED: *mut HeapTy = ptr::dangling_mut::<HeapTy>();
 
+    // r[impl alloc.tls-no-destructor]
     thread_local! {
         /// Fast-path pointer: null = uninit, DESTROYED = torn down,
         /// otherwise points to heap-allocated Heap.
+        /// `Cell<*mut T>` has no Drop, so no TLS destructor is registered.
         static HEAP: Cell<*mut HeapTy> = const { Cell::new(ptr::null_mut()) };
     }
 

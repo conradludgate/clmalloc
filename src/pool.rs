@@ -16,7 +16,7 @@ use crate::size_class::NUM_CLASSES;
 use crate::slab::{SLAB_SIZE, Slab, SlabBase, SlabList, slab_list_pop, slab_list_push};
 use crate::sys::PageAllocator;
 
-const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+pub(crate) const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const MAX_SEGMENTS: usize = 4096;
 const SLABS_PER_SEGMENT: usize = SEGMENT_SIZE / SLAB_SIZE;
 
@@ -406,13 +406,14 @@ impl<P: PageAllocator> PagePool<P> {
     pub fn snapshot(&self) -> crate::metrics::MetricsSnapshot {
         let mut snap = crate::metrics::MetricsSnapshot::new();
         let state = self.state.lock();
-        snap.mapped = state.segment_count as u64 * SEGMENT_SIZE as u64
-            + state.large_mapped_bytes;
+        snap.mapped = state.segment_count as u64 * SEGMENT_SIZE as u64 + state.large_mapped_bytes;
         let outstanding_slabs = state.outstanding_slabs;
         state.metrics.aggregate_heap_metrics(&mut snap);
         drop(state);
         snap.finalize();
-        let large_live = snap.large_alloc_bytes.saturating_sub(snap.large_dealloc_bytes);
+        let large_live = snap
+            .large_alloc_bytes
+            .saturating_sub(snap.large_dealloc_bytes);
         snap.active = outstanding_slabs * SLAB_SIZE as u64 + large_live;
         snap
     }
@@ -505,6 +506,41 @@ mod tests {
         let slab = pool.alloc_slab().unwrap();
         assert_eq!(slab.as_ptr() as usize % SLAB_SIZE, 0);
         pool.dealloc_slab(slab);
+    }
+
+    // r[verify pool.purge-free-slab] r[verify sys.purge-pages]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_zeroes_slab_pages() {
+        use crate::sys::MmapAllocator;
+        let pool = PagePool::new(MmapAllocator);
+
+        // Allocate two slabs so the segment isn't fully carved, ensuring
+        // dealloc_slab takes the per-slab purge path (not segment munmap).
+        let slab1 = pool.alloc_slab().unwrap();
+        let slab2 = pool.alloc_slab().unwrap();
+
+        // Write non-zero data into slab1.
+        let ptr = slab1.as_ptr().cast::<u8>();
+        unsafe { core::ptr::write_bytes(ptr, 0xAB, SLAB_SIZE) };
+
+        // Return slab1 — pool calls page_alloc.purge which issues
+        // madvise(MADV_DONTNEED). On Linux, subsequent reads return zeroes.
+        pool.dealloc_slab(slab1);
+
+        // Re-allocate — should get slab1 back from the free list.
+        let reused = pool.alloc_slab().unwrap();
+        assert_eq!(reused, slab1);
+
+        // Verify pages are zeroed (MADV_DONTNEED guarantees this on Linux).
+        let slice = unsafe { core::slice::from_raw_parts(reused.as_ptr().cast::<u8>(), SLAB_SIZE) };
+        assert!(
+            slice.iter().all(|&b| b == 0),
+            "purged slab should be zeroed"
+        );
+
+        pool.dealloc_slab(reused);
+        pool.dealloc_slab(slab2);
     }
 
     // r[verify pool.purge]

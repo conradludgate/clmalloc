@@ -647,22 +647,14 @@ mod tests {
     }
 
     #[test]
-    fn slab_is_send_not_sync() {
+    fn slab_is_send_slabref_is_send_sync() {
         fn assert_send<T: Send>() {}
-        fn assert_not_sync<T>()
-        where
-        // T must NOT implement Sync — this compiles only if T: !Sync,
-        // by requiring a bound that would conflict. We use a negative
-        // reasoning trick: PhantomData<Cell<()>> ensures !Sync.
-        {
-        }
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send::<Slab>();
-        assert_not_sync::<Slab>();
         assert_send_sync::<SlabRef>();
     }
 
-    // r[verify slab.local-freelist]
+    // r[verify slab.local-freelist] r[verify slab.bump-alloc]
     #[test]
     fn alloc_dealloc_no_duplicates() {
         let mut t = TestSlab::new(0);
