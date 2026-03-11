@@ -39,6 +39,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn id(&self) -> usize {
         self.id
     }

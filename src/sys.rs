@@ -85,6 +85,7 @@ unsafe impl PageAllocator for MmapAllocator {
 ///
 /// Suitable for tests and Miri where mmap syscalls are unavailable.
 /// Must not be used when clmalloc is itself the `#[global_allocator]`.
+#[cfg_attr(not(test), expect(dead_code))]
 pub struct SystemAllocator;
 
 unsafe impl PageAllocator for SystemAllocator {

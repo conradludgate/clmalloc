@@ -1,6 +1,9 @@
-pub mod heap;
-pub mod pool;
-pub mod size_class;
-pub mod slab;
-pub mod sys;
+mod global;
+mod heap;
+mod pool;
+mod size_class;
+mod slab;
 mod sync;
+mod sys;
+
+pub use global::ClMalloc;

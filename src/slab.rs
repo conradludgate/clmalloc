@@ -173,14 +173,17 @@ impl Slab {
         self.header.cast()
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn slot_size(&self) -> usize {
         self.header().slot_size as usize
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn slot_count(&self) -> usize {
         self.header().slot_count as usize
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn size_class_index(&self) -> usize {
         self.header().size_class_index as usize
     }
@@ -296,14 +299,17 @@ impl SlabRef {
         self.header == other.header
     }
 
+    #[expect(dead_code)]
     pub fn slot_size(&self) -> usize {
         self.header().slot_size as usize
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn slot_count(&self) -> usize {
         self.header().slot_count as usize
     }
 
+    #[expect(dead_code)]
     pub fn size_class_index(&self) -> usize {
         self.header().size_class_index as usize
     }
