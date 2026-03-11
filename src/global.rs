@@ -137,7 +137,7 @@ mod imp {
                 unsafe { (*heap).dealloc(NonNull::new_unchecked(ptr), layout) };
                 return;
             }
-            // Post-destructor fallback: heap is gone, use remote dealloc directly.
+            // r[impl alloc.post-exit-dealloc]
             if let Some(_idx) = size_class::class_index(layout) {
                 let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr) };
                 slab_ref.dealloc_remote(unsafe { NonNull::new_unchecked(ptr) });

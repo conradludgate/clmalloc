@@ -28,11 +28,20 @@ When the active slab is fully allocated and its remote free list is also
 empty, the heap MUST request a new slab from the global page pool and make
 it the active slab for that size class.
 
+r[heap.page-queue]
+Non-active slabs MUST be tracked in two per-class queues: a full queue
+(exhausted slabs awaiting remote frees) and a partial queue (slabs with
+known free slots). When the active slab is exhausted, the heap MUST first
+try to pop from the partial queue (O(1)). If the partial queue is empty,
+the heap MUST scan the full queue, draining remote frees on each slab,
+and move all discovered partial slabs to the partial queue in one pass.
+This amortises the scan cost across multiple subsequent allocations.
+
 r[heap.dealloc-o1]
 Deallocation MUST be O(1). If the pointer belongs to the active slab for its
 size class, the heap MUST use the local free list (no atomics). Otherwise the
-heap MUST push the pointer into the free cache. The heap MUST NOT walk the
-retired list during deallocation.
+heap MUST push the pointer into the free cache. The heap MUST NOT walk
+any slab queue during deallocation.
 
 r[heap.free-cache]
 The heap MUST maintain a per-size-class free cache that absorbs non-active-slab

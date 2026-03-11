@@ -26,6 +26,15 @@ local operations, and a shared handle (`SlabRef`) that only permits atomic
 remote deallocation. Determining whether a deallocation is local or remote
 is the responsibility of the heap layer.
 
+## Allocation
+
+r[slab.bump-alloc]
+Fresh slabs MUST use a bump pointer for initial allocation. The bump
+pointer starts at the first slot offset and advances by `slot_size` on
+each allocation. Once the bump region is exhausted, allocation MUST fall
+back to the local free list (recycled slots). Slab initialization MUST
+be O(1) — the free list is NOT pre-built.
+
 ## Local free list
 
 r[slab.local-freelist]

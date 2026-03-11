@@ -3,6 +3,10 @@
 //! All pool state (free slab list + segment carving) is protected by a
 //! single `spin::Mutex`. This is a cold path — accessed only when a heap
 //! needs a new slab or returns one — so lock-free complexity is unnecessary.
+//!
+//! The pool releases physical pages back to the OS when an entire segment's
+//! slabs are returned (purge). Segment allocation (mmap) is performed
+//! outside the lock to avoid blocking other threads on syscall latency.
 
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
@@ -12,8 +16,9 @@ use crate::size_class::NUM_CLASSES;
 use crate::slab::{Slab, SlabBase, SLAB_SIZE};
 use crate::sys::PageAllocator;
 
-const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB = 32 slabs
+const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const MAX_SEGMENTS: usize = 4096;
+const SLABS_PER_SEGMENT: usize = SEGMENT_SIZE / SLAB_SIZE;
 
 #[repr(C, align(65536))]
 struct SlabPage([u8; SLAB_SIZE]);
@@ -31,8 +36,14 @@ struct PoolState {
     abandoned_heads: [Option<NonNull<SlabBase>>; NUM_CLASSES],
     segment_cursor: Link,
     segment_end: Link,
+    /// Index into `segments[]` for the segment currently being carved.
+    carving_idx: usize,
     segments: [*mut Segment; MAX_SEGMENTS],
     segment_count: usize,
+    /// Number of slabs from each segment currently in use (allocated to a
+    /// heap or on the abandoned list — i.e. not on the free list and not
+    /// still uncarved).
+    seg_outstanding: [u8; MAX_SEGMENTS],
 }
 
 // SAFETY: PoolState is only accessed under the spin lock.
@@ -56,8 +67,10 @@ impl<P: PageAllocator> PagePool<P> {
                 abandoned_heads: [None; NUM_CLASSES],
                 segment_cursor: null_mut::<SlabPage>(),
                 segment_end: null_mut::<SlabPage>(),
+                carving_idx: 0,
                 segments: [null_mut::<Segment>(); MAX_SEGMENTS],
                 segment_count: 0,
+                seg_outstanding: [0; MAX_SEGMENTS],
             }),
         }
     }
@@ -66,7 +79,8 @@ impl<P: PageAllocator> PagePool<P> {
     ///
     /// Fast path: pop from the free list.
     /// Slow path: carve from the current segment.
-    /// Slowest path: allocate a new segment from the page allocator.
+    /// Slowest path: allocate a new segment from the page allocator (outside
+    /// the lock).
     #[cold]
     pub fn alloc_slab(&self) -> Option<NonNull<SlabBase>> {
         let mut state = self.state.lock();
@@ -74,40 +88,146 @@ impl<P: PageAllocator> PagePool<P> {
         if !state.free_head.is_null() {
             let slab = state.free_head;
             state.free_head = unsafe { slab.cast::<Link>().read() };
+            let seg = Self::find_segment(&state, slab as usize);
+            state.seg_outstanding[seg] += 1;
             return Some(unsafe { NonNull::new_unchecked(slab.cast()) });
         }
 
-        // r[impl pool.batch-mmap]
-        if state.segment_cursor >= state.segment_end {
-            let base = self.page_alloc.alloc(Layout::new::<Segment>())?;
-            let segment = base.as_ptr().cast::<Segment>();
-            // r[impl pool.no-panic-under-lock]
-            if state.segment_count >= MAX_SEGMENTS {
-                unsafe { self.page_alloc.dealloc(base, Layout::new::<Segment>()) };
-                return None;
+        if state.segment_cursor < state.segment_end {
+            let slab = state.segment_cursor;
+            state.segment_cursor = unsafe { slab.add(1) };
+            let seg = state.carving_idx;
+            state.seg_outstanding[seg] += 1;
+            return Some(unsafe { NonNull::new_unchecked(slab.cast()) });
+        }
+
+        // r[impl pool.no-syscall-under-lock] r[impl pool.batch-mmap]
+        drop(state);
+        self.alloc_slab_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_slab_slow(&self) -> Option<NonNull<SlabBase>> {
+        let base = self.page_alloc.alloc(Layout::new::<Segment>())?;
+        let mut state = self.state.lock();
+
+        // r[impl pool.no-panic-under-lock]
+        if state.segment_count >= MAX_SEGMENTS {
+            drop(state);
+            unsafe { self.page_alloc.dealloc(base, Layout::new::<Segment>()) };
+            return None;
+        }
+
+        let seg_idx = state.segment_count;
+        state.segments[seg_idx] = base.as_ptr().cast();
+        state.segment_count = seg_idx + 1;
+        state.seg_outstanding[seg_idx] = 1;
+
+        if state.segment_cursor < state.segment_end {
+            // Another thread set up a carving segment while we were in mmap.
+            // Push remaining slabs to the free list so they aren't lost.
+            let seg_base: Link = base.as_ptr().cast();
+            for i in (1..SLABS_PER_SEGMENT).rev() {
+                let slab = unsafe { seg_base.add(i) };
+                unsafe { slab.cast::<Link>().write(state.free_head) };
+                state.free_head = slab;
             }
-            let idx = state.segment_count;
-            state.segments[idx] = segment;
-            state.segment_count = idx + 1;
-            state.segment_cursor = base.as_ptr().cast();
+        } else {
+            state.carving_idx = seg_idx;
+            state.segment_cursor = unsafe { base.as_ptr().cast::<SlabPage>().add(1) };
             state.segment_end = unsafe { base.as_ptr().add(SEGMENT_SIZE).cast() };
         }
 
-        let slab = state.segment_cursor;
-        state.segment_cursor = unsafe { slab.add(1) };
-        Some(unsafe { NonNull::new_unchecked(slab.cast()) })
+        Some(unsafe { NonNull::new_unchecked(base.as_ptr().cast()) })
     }
 
     /// Return a fully-free slab to the pool for reuse.
     ///
-    /// The first pointer-sized bytes of the slab's memory are used as the
-    /// free list next-pointer (the slab is fully free, so its memory is unused).
+    /// When the last outstanding slab of a segment is returned, the entire
+    /// segment is released back to the OS.
+    // r[impl pool.purge]
     #[cold]
     pub fn dealloc_slab(&self, base: NonNull<SlabBase>) {
-        let mut state = self.state.lock();
         let slab: Link = base.as_ptr().cast();
+        let mut state = self.state.lock();
         unsafe { slab.cast::<Link>().write(state.free_head) };
         state.free_head = slab;
+
+        let seg = Self::find_segment(&state, slab as usize);
+        state.seg_outstanding[seg] -= 1;
+
+        if state.seg_outstanding[seg] == 0
+            && Self::segment_fully_carved(&state, seg)
+        {
+            let segment_ptr = state.segments[seg];
+            Self::remove_segment_slabs(&mut state, segment_ptr as usize);
+            Self::swap_remove_segment(&mut state, seg);
+            drop(state);
+            unsafe {
+                self.page_alloc.dealloc(
+                    NonNull::new_unchecked(segment_ptr.cast()),
+                    Layout::new::<Segment>(),
+                );
+            }
+        }
+    }
+
+    /// True if all slabs in the segment have been carved (none still in
+    /// the uncarved cursor region).
+    fn segment_fully_carved(state: &PoolState, seg_idx: usize) -> bool {
+        let seg_base = state.segments[seg_idx] as usize;
+        let seg_end = seg_base + SEGMENT_SIZE;
+        let cursor = state.segment_cursor as usize;
+        // If the cursor falls within this segment, uncarved slabs remain.
+        !(cursor >= seg_base && cursor < seg_end)
+    }
+
+    fn find_segment(state: &PoolState, addr: usize) -> usize {
+        for i in 0..state.segment_count {
+            let base = state.segments[i] as usize;
+            if addr >= base && addr < base + SEGMENT_SIZE {
+                return i;
+            }
+        }
+        unreachable!("slab does not belong to any segment")
+    }
+
+    /// Walk the free list and unlink all slabs belonging to the given segment.
+    fn remove_segment_slabs(state: &mut PoolState, seg_base: usize) {
+        let seg_end = seg_base + SEGMENT_SIZE;
+        let mut prev: *mut Link = &mut state.free_head;
+        unsafe {
+            while !(*prev).is_null() {
+                let slab = *prev;
+                let addr = slab as usize;
+                if addr >= seg_base && addr < seg_end {
+                    *prev = slab.cast::<Link>().read();
+                } else {
+                    prev = slab.cast::<Link>();
+                }
+            }
+        }
+    }
+
+    /// Swap-remove a segment from all tracking arrays.
+    fn swap_remove_segment(state: &mut PoolState, seg_idx: usize) {
+        let last = state.segment_count - 1;
+        if seg_idx != last {
+            state.segments[seg_idx] = state.segments[last];
+            state.seg_outstanding[seg_idx] = state.seg_outstanding[last];
+            if state.carving_idx == last {
+                state.carving_idx = seg_idx;
+            }
+        }
+        state.segments[last] = null_mut();
+        state.seg_outstanding[last] = 0;
+        state.segment_count = last;
+    }
+
+    #[cfg(test)]
+    fn segment_count(&self) -> usize {
+        self.state.lock().segment_count
     }
 
     /// Place a non-fully-free slab on the abandoned list for its size class.
@@ -118,7 +238,7 @@ impl<P: PageAllocator> PagePool<P> {
     pub fn abandon_slab(&self, mut slab: Slab) {
         let class_idx = slab.size_class_index();
         let mut state = self.state.lock();
-        slab.set_next_abandoned(state.abandoned_heads[class_idx]);
+        slab.set_next_link(state.abandoned_heads[class_idx]);
         state.abandoned_heads[class_idx] = Some(slab.into_raw());
     }
 
@@ -131,8 +251,8 @@ impl<P: PageAllocator> PagePool<P> {
         let mut state = self.state.lock();
         let head = state.abandoned_heads[class_idx]?;
         let mut slab = unsafe { Slab::from_raw(head) };
-        state.abandoned_heads[class_idx] = slab.next_abandoned();
-        slab.set_next_abandoned(None);
+        state.abandoned_heads[class_idx] = slab.next_link();
+        slab.set_next_link(None);
         Some(slab)
     }
 
@@ -244,6 +364,64 @@ mod tests {
         pool.dealloc_slab(slab);
     }
 
+    // r[verify pool.purge]
+    #[test]
+    fn fully_free_segment_is_purged() {
+        let pool = pool();
+        let slabs_per_seg = SEGMENT_SIZE / SLAB_SIZE;
+
+        let mut slabs = Vec::new();
+        for _ in 0..slabs_per_seg {
+            slabs.push(pool.alloc_slab().unwrap());
+        }
+        assert_eq!(pool.segment_count(), 1);
+
+        for slab in slabs {
+            pool.dealloc_slab(slab);
+        }
+        assert_eq!(pool.segment_count(), 0, "segment should be purged");
+
+        // Pool is still usable: next alloc triggers a fresh mmap.
+        let fresh = pool.alloc_slab().unwrap();
+        assert_eq!(pool.segment_count(), 1);
+        pool.dealloc_slab(fresh);
+    }
+
+    // r[verify pool.purge]
+    #[test]
+    fn partial_segment_not_purged() {
+        let pool = pool();
+        let slabs_per_seg = SEGMENT_SIZE / SLAB_SIZE;
+
+        let mut slabs = Vec::new();
+        for _ in 0..slabs_per_seg {
+            slabs.push(pool.alloc_slab().unwrap());
+        }
+
+        // Return all but one — segment must NOT be purged.
+        let kept = slabs.pop().unwrap();
+        for slab in slabs {
+            pool.dealloc_slab(slab);
+        }
+        assert_eq!(pool.segment_count(), 1, "segment should still exist");
+
+        pool.dealloc_slab(kept);
+        assert_eq!(pool.segment_count(), 0, "now it should be purged");
+    }
+
+    // r[verify pool.purge]
+    #[test]
+    fn uncarved_segment_not_purged() {
+        let pool = pool();
+        // Allocate just 1 slab from a segment (31 remain uncarved).
+        let s = pool.alloc_slab().unwrap();
+        pool.dealloc_slab(s);
+        // Segment has uncarved slabs → must not be purged.
+        assert_eq!(pool.segment_count(), 1);
+    }
+
+    // r[verify pool.no-syscall-under-lock]
+    // Exercises the race path where multiple threads mmap concurrently.
     // r[verify pool.thread-safe]
     #[test]
     fn concurrent_alloc_dealloc() {

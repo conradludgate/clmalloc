@@ -73,7 +73,13 @@ struct SlabHeader {
     size_class_index: u8,
     // r[impl heap.identity]
     heap_id: usize,
-    next_abandoned: Option<NonNull<SlabBase>>,
+    next_link: Option<NonNull<SlabBase>>,
+    // r[impl slab.bump-alloc]
+    /// Byte offset of the next slot to carve from the bump region.
+    /// Once `bump_remaining == 0`, all slots have been carved and
+    /// allocation falls back to the free list.
+    bump_cursor: u16,
+    bump_remaining: u16,
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
     local: UnsafeCell<LocalState>,
     // r[impl slab.remote-freelist]
@@ -81,6 +87,7 @@ struct SlabHeader {
 }
 
 impl SlabHeader {
+    // r[impl slab.bump-alloc]
     unsafe fn init(base: NonNull<u8>, size_class_index: u8, heap_id: usize) -> NonNull<SlabHeader> {
         let slot_size = size_class::class_size(size_class_index as usize);
         debug_assert!(slot_size >= size_of::<Link>());
@@ -89,16 +96,7 @@ impl SlabHeader {
         let slot_count = (SLAB_SIZE - slots_offset) / slot_size;
         debug_assert!(slot_count > 0 && slot_count <= u16::MAX as usize);
 
-        let base_ptr = base.as_ptr();
-
-        let mut prev: Link = null_mut();
-        for i in (0..slot_count).rev() {
-            let slot = unsafe { base_ptr.add(slots_offset + i * slot_size) };
-            unsafe { write_next(slot, prev) };
-            prev = slot;
-        }
-
-        let header = base_ptr.cast::<SlabHeader>();
+        let header = base.as_ptr().cast::<SlabHeader>();
         unsafe {
             ptr::write(
                 header,
@@ -108,9 +106,11 @@ impl SlabHeader {
                     slots_offset: slots_offset as u16,
                     size_class_index,
                     heap_id,
-                    next_abandoned: None,
+                    next_link: None,
+                    bump_cursor: slots_offset as u16,
+                    bump_remaining: slot_count as u16,
                     local: UnsafeCell::new(LocalState {
-                        head: prev,
+                        head: null_mut(),
                         free_count: slot_count as u16,
                     }),
                     remote_head: AtomicPtr::new(null_mut()),
@@ -195,18 +195,16 @@ impl Slab {
         unsafe { (*self.header.as_ptr()).heap_id = id };
     }
 
-    pub(crate) fn next_abandoned(&self) -> Option<NonNull<SlabBase>> {
-        self.header().next_abandoned
+    pub(crate) fn next_link(&self) -> Option<NonNull<SlabBase>> {
+        self.header().next_link
     }
 
-    pub(crate) fn set_next_abandoned(&mut self, next: Option<NonNull<SlabBase>>) {
-        unsafe { (*self.header.as_ptr()).next_abandoned = next };
+    pub(crate) fn set_next_link(&mut self, next: Option<NonNull<SlabBase>>) {
+        unsafe { (*self.header.as_ptr()).next_link = next };
     }
 
-    /// Returns a mutable reference to the `next_abandoned` field in the header.
-    /// Used by the heap to thread retired slabs into an intrusive linked list.
-    pub(crate) fn next_abandoned_mut(&mut self) -> &mut Option<NonNull<SlabBase>> {
-        unsafe { &mut (*self.header.as_ptr()).next_abandoned }
+    pub(crate) fn next_link_mut(&mut self) -> &mut Option<NonNull<SlabBase>> {
+        unsafe { &mut (*self.header.as_ptr()).next_link }
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
@@ -236,11 +234,15 @@ impl Slab {
         self.free_count() == self.header().slot_count
     }
 
-    // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
-    /// Pop a slot from the local free list. O(1).
+    // r[impl slab.local-freelist] r[impl slab.local-no-atomics] r[impl slab.bump-alloc]
+    /// Allocate a slot. Tries the free list first (recycled slots stay
+    /// cache-hot), then falls back to the bump pointer for virgin slots.
     #[inline]
     pub fn alloc(&mut self) -> Option<NonNull<u8>> {
-        self.header().local.with_mut(|p| {
+        let header = unsafe { &mut *self.header.as_ptr() };
+
+        // Fast path: pop from the local free list (recycled slots).
+        let ptr = header.local.with_mut(|p| {
             let local = unsafe { &mut *p };
             let head = local.head;
             if head.is_null() {
@@ -249,7 +251,22 @@ impl Slab {
             local.head = unsafe { read_next(head) };
             local.free_count -= 1;
             Some(unsafe { NonNull::new_unchecked(head) })
-        })
+        });
+        if ptr.is_some() {
+            return ptr;
+        }
+
+        // Bump-pointer path: carve a fresh slot (no memory reads needed).
+        if header.bump_remaining > 0 {
+            let base = self.header.as_ptr() as *mut u8;
+            let slot = unsafe { base.add(header.bump_cursor as usize) };
+            header.bump_cursor = header.bump_cursor.wrapping_add(header.slot_size);
+            header.bump_remaining -= 1;
+            header.local.with_mut(|p| unsafe { (*p).free_count -= 1 });
+            return Some(unsafe { NonNull::new_unchecked(slot) });
+        }
+
+        None
     }
 
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
