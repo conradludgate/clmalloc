@@ -303,6 +303,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
 
         if self.caches[idx].is_full() {
             self.flush_cache(idx);
+            self.collect_full_list(idx);
         }
         self.caches[idx].push(ptr);
     }
@@ -379,6 +380,30 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
                     slab.set_next_link(self.partial_heads[class_idx]);
                     self.partial_heads[class_idx] = Some(slab.into_raw());
                 }
+                continue;
+            }
+            prev = slab.next_link_mut();
+        }
+    }
+
+    /// Walk the full list after a cache flush, returning fully-free slabs
+    /// to the pool. Unlike `scan_full_list`, this runs on the dealloc path
+    /// and does not promote partial slabs — it only reclaims empty ones.
+    #[cold]
+    #[inline(never)]
+    fn collect_full_list(&mut self, class_idx: usize) {
+        let mut prev: *mut Option<NonNull<SlabBase>> = &raw mut self.full_heads[class_idx];
+        while let Some(base) = unsafe { *prev } {
+            // SAFETY: base came from our full list; slab is valid.
+            let mut slab = unsafe { Slab::from_raw(base) };
+            if slab.has_pending_remote() {
+                slab.drain_remote();
+            }
+            if slab.is_fully_free() {
+                let next = slab.next_link();
+                // SAFETY: prev points at a valid Option in full_heads.
+                unsafe { *prev = next };
+                self.pool.dealloc_slab(slab.into_raw());
                 continue;
             }
             prev = slab.next_link_mut();

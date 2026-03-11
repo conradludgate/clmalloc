@@ -139,12 +139,14 @@ impl HeapMetrics {
 
 // r[impl metrics.abandon-count] r[impl metrics.adopt-count]
 // r[impl metrics.segment-mmap-count] r[impl metrics.segment-munmap-count]
+// r[impl metrics.slab-purge-count]
 // r[impl metrics.pool-lock-count]
 pub(crate) struct PoolMetrics {
     pub abandon_count: [u64; NUM_CLASSES],
     pub adopt_count: [u64; NUM_CLASSES],
     pub segment_mmap_count: u64,
     pub segment_munmap_count: u64,
+    pub slab_purge_count: u64,
     pub pool_lock_count: u64,
     heap_ptrs: [*const HeapMetrics; MAX_HEAPS],
     heap_count: usize,
@@ -162,6 +164,7 @@ impl PoolMetrics {
             adopt_count: [0; NUM_CLASSES],
             segment_mmap_count: 0,
             segment_munmap_count: 0,
+            slab_purge_count: 0,
             pool_lock_count: 0,
             heap_ptrs: [core::ptr::null(); MAX_HEAPS],
             heap_count: 0,
@@ -217,6 +220,7 @@ impl PoolMetrics {
         snapshot.adopt_count = self.adopt_count;
         snapshot.segment_mmap_count = self.segment_mmap_count;
         snapshot.segment_munmap_count = self.segment_munmap_count;
+        snapshot.slab_purge_count = self.slab_purge_count;
         snapshot.pool_lock_count = self.pool_lock_count;
     }
 }
@@ -249,6 +253,7 @@ pub struct MetricsSnapshot {
 
     pub segment_mmap_count: u64,
     pub segment_munmap_count: u64,
+    pub slab_purge_count: u64,
 
     pub large_alloc_count: u64,
     pub large_alloc_bytes: u64,
@@ -279,6 +284,7 @@ impl MetricsSnapshot {
             adopt_count: [0; NUM_CLASSES],
             segment_mmap_count: 0,
             segment_munmap_count: 0,
+            slab_purge_count: 0,
             large_alloc_count: 0,
             large_alloc_bytes: 0,
             large_dealloc_bytes: 0,

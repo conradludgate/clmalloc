@@ -190,8 +190,10 @@ impl<P: PageAllocator> PagePool<P> {
     /// Return a fully-free slab to the pool for reuse.
     ///
     /// When the last outstanding slab of a segment is returned, the entire
-    /// segment is released back to the OS.
-    // r[impl pool.purge]
+    /// segment is released back to the OS via munmap. Otherwise, the slab's
+    /// physical pages are released via `madvise` so the OS can reclaim them
+    /// while keeping the virtual address range available for reuse.
+    // r[impl pool.purge] r[impl pool.purge-free-slab]
     #[cold]
     pub fn dealloc_slab(&self, base: NonNull<SlabBase>) {
         let slab: Link = base.as_ptr().cast();
@@ -227,6 +229,15 @@ impl<P: PageAllocator> PagePool<P> {
                     Layout::new::<Segment>(),
                 );
             }
+        } else {
+            #[cfg(feature = "metrics")]
+            {
+                state.metrics.slab_purge_count += 1;
+            }
+            drop(state);
+            // SAFETY: base points to a SLAB_SIZE-aligned, SLAB_SIZE-byte region
+            // within a live mmap'd segment.
+            unsafe { self.page_alloc.purge(base.cast(), SLAB_SIZE) };
         }
     }
 

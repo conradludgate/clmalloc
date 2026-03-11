@@ -22,6 +22,17 @@ pub unsafe trait PageAllocator {
     /// # Safety
     /// `ptr` must have been returned by `alloc` with the same `layout`.
     unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout);
+
+    /// Release physical pages back to the OS without releasing the virtual
+    /// address range. The memory remains accessible (reads return zeroes)
+    /// but the OS may reclaim the physical frames.
+    ///
+    /// No-op by default; overridden by `MmapAllocator`.
+    ///
+    /// # Safety
+    /// `ptr` and `len` must describe a page-aligned region within a
+    /// previously allocated range.
+    unsafe fn purge(&self, _ptr: NonNull<u8>, _len: usize) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +85,20 @@ unsafe impl PageAllocator for MmapAllocator {
 
     unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
         unsafe { libc::munmap(ptr.as_ptr().cast(), layout.size()) };
+    }
+
+    // r[impl sys.purge-pages]
+    unsafe fn purge(&self, ptr: NonNull<u8>, len: usize) {
+        // SAFETY: caller guarantees ptr/len describe a page-aligned region
+        // within a live mmap'd range.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_DONTNEED);
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_FREE);
+        }
     }
 }
 

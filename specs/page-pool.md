@@ -23,6 +23,14 @@ The page pool MUST obtain memory from the OS through a pluggable page
 allocator trait. The production implementation MUST use mmap (or platform
 equivalent) with MAP_ANONYMOUS | MAP_PRIVATE.
 
+r[sys.purge-pages]
+The page allocator trait MUST provide a `purge` method that releases
+physical pages back to the OS without unmapping the virtual address
+range. On Linux this MUST use `madvise(MADV_DONTNEED)`. On macOS this
+MUST use `madvise(MADV_FREE)`. Subsequent reads from purged memory
+MUST return zeroes. The default implementation MAY be a no-op (e.g.
+for test backends).
+
 r[pool.batch-mmap]
 The page pool MUST request memory from the OS in large batches (e.g.
 2 MiB or more) and carve slabs from the batch, to amortize syscall cost.
@@ -40,6 +48,13 @@ When a segment has all of its slabs on the free list, the page pool MUST
 return the physical pages to the OS (e.g. via `madvise(MADV_DONTNEED)` or
 `munmap`). This ensures that long-running processes release memory when
 usage drops.
+
+r[pool.purge-free-slab]
+When a slab is returned to the pool free list and the segment will NOT
+be fully purged, the pool MUST release the slab's physical pages back
+to the OS via `PageAllocator::purge`. The virtual address range is
+retained so the slab can be reused without a new mmap. This reduces
+RSS when partially-occupied segments prevent full segment munmap.
 
 ## Exhaustion
 

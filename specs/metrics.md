@@ -144,6 +144,12 @@ The page pool MUST maintain a cumulative count of segment munmap calls
 (purges). A high munmap rate may indicate the purge threshold is too
 aggressive.
 
+r[metrics.slab-purge-count]
+The page pool MUST maintain a cumulative count of slab purge operations
+(madvise calls on free slabs). This tracks how often the allocator
+releases physical pages from individual slabs without unmapping the
+entire segment.
+
 ## Large allocations
 
 r[metrics.large-alloc-count]
