@@ -19,7 +19,7 @@ use rand::{Rng, RngExt, SeedableRng};
 
 // -- Configuration -----------------------------------------------------------
 
-/// Default sample interval in bytes (512 KiB, matching jemalloc's lg_prof_sample=19).
+/// Default sample interval in bytes (512 KiB, matching jemalloc's `lg_prof_sample=19`).
 const DEFAULT_SAMPLE_INTERVAL: u64 = 512 * 1024;
 
 // r[impl pprof.activate]
@@ -35,12 +35,19 @@ pub fn is_prof_active() -> bool {
     PROF_ACTIVE.load(Ordering::Acquire)
 }
 
+/// # Panics
+/// Panics if `bytes` is zero.
 pub fn set_sample_interval(bytes: u64) {
     assert!(bytes > 0, "sample interval must be > 0");
     SAMPLE_INTERVAL.store(bytes, Ordering::Release);
 }
 
 /// Geometric(1/R) sample: ceil(-R * ln(U)) where U is uniform (0,1).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn geometric(rng: &mut impl Rng, mean: u64) -> u64 {
     let u: f64 = rng.random();
     let u = if u <= 0.0 { f64::MIN_POSITIVE } else { u };
@@ -61,7 +68,7 @@ impl Sampler {
     pub fn new(seed: u64) -> Self {
         let mut rng = SmallRng::seed_from_u64(seed);
         let interval = SAMPLE_INTERVAL.load(Ordering::Relaxed);
-        let countdown = geometric(&mut rng, interval) as i64;
+        let countdown = geometric(&mut rng, interval).cast_signed();
         Self {
             countdown,
             rng,
@@ -72,6 +79,7 @@ impl Sampler {
     /// Subtract `size` from the countdown. Returns `true` if a sample should
     /// be taken (countdown crossed zero).
     #[inline]
+    #[allow(clippy::cast_possible_wrap)]
     pub fn check(&mut self, size: usize) -> bool {
         self.countdown -= size as i64;
         if self.countdown <= 0 {
@@ -83,7 +91,7 @@ impl Sampler {
     }
 
     fn reset(&mut self) {
-        self.countdown = geometric(&mut self.rng, self.interval) as i64;
+        self.countdown = geometric(&mut self.rng, self.interval).cast_signed();
     }
 }
 
@@ -112,6 +120,7 @@ impl StackTable {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn intern(&mut self, frames: Vec<usize>) -> StackId {
         let next_id = self.counters.len() as StackId;
         *self.map.entry(frames).or_insert_with(|| {
@@ -167,7 +176,9 @@ impl PprofState {
 static PPROF: Mutex<Option<PprofState>> = Mutex::new(None);
 
 fn with_state<R>(f: impl FnOnce(&mut PprofState) -> R) -> R {
-    let mut guard = PPROF.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = PPROF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = guard.get_or_insert_with(PprofState::new);
     f(state)
 }
@@ -192,8 +203,8 @@ pub(crate) fn record_sample(ptr: *mut u8, size: usize, class_idx: u8) {
         let weight = unbiased_weight(size, interval);
         counters.alloc_count += weight;
         counters.alloc_bytes += weight * size as u64;
-        counters.live_count += weight as i64;
-        counters.live_bytes += (weight * size as u64) as i64;
+        counters.live_count += weight.cast_signed();
+        counters.live_bytes += (weight * size as u64).cast_signed();
 
         state.side.map.insert(
             ptr as usize,
@@ -213,14 +224,19 @@ pub(crate) fn maybe_remove_sample(ptr: *mut u8) {
             let interval = SAMPLE_INTERVAL.load(Ordering::Relaxed);
             let weight = unbiased_weight(record.size, interval);
             let counters = &mut state.stacks.counters[record.stack_id as usize];
-            counters.live_count -= weight as i64;
-            counters.live_bytes -= (weight * record.size as u64) as i64;
+            counters.live_count -= weight.cast_signed();
+            counters.live_bytes -= (weight * record.size as u64).cast_signed();
         }
     });
 }
 
 /// Unbiased weight: compensate for size-dependent sampling probability.
 /// w = Z / (1 - e^{-Z/R}) where Z = alloc size, R = sample interval.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn unbiased_weight(size: usize, interval: u64) -> u64 {
     let z = size as f64;
     let r = interval as f64;
@@ -236,6 +252,8 @@ fn unbiased_weight(size: usize, interval: u64) -> u64 {
 // -- Dump (pprof protobuf) ---------------------------------------------------
 
 // r[impl pprof.dump-api] r[impl pprof.dump-format] r[impl pprof.sample-types]
+/// # Errors
+/// Returns an error if writing the gzip-compressed protobuf data fails.
 pub fn dump(writer: &mut dyn Write) -> std::io::Result<()> {
     let profile_bytes = with_state(|state| build_profile(state));
     let mut encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
@@ -262,6 +280,7 @@ fn build_profile(state: &PprofState) -> Vec<u8> {
     let mut func_map: HashMap<usize, u64> = HashMap::new();
 
     // Build locations and functions from all stacks.
+    #[allow(clippy::cast_possible_truncation)]
     for frames in state.stacks.map.keys() {
         for &ip in frames {
             if loc_map.contains_key(&ip) {
@@ -314,8 +333,8 @@ fn build_profile(state: &PprofState) -> Vec<u8> {
         // value (field 2, repeated int64)
         encode_varint_field(&mut sample, 2, counters.alloc_count);
         encode_varint_field(&mut sample, 2, counters.alloc_bytes);
-        encode_varint_field(&mut sample, 2, counters.live_count as u64);
-        encode_varint_field(&mut sample, 2, counters.live_bytes as u64);
+        encode_varint_field(&mut sample, 2, counters.live_count.cast_unsigned());
+        encode_varint_field(&mut sample, 2, counters.live_bytes.cast_unsigned());
 
         // label: size_class (field 3)
         if let Some(record) = state.side.map.values().find(|r| r.stack_id == stack_id) {
@@ -408,12 +427,12 @@ fn encode_varint(buf: &mut Vec<u8>, mut val: u64) {
 }
 
 fn encode_varint_field(buf: &mut Vec<u8>, field: u32, val: u64) {
-    encode_varint(buf, (field as u64) << 3); // wire type 0 = varint
+    encode_varint(buf, u64::from(field) << 3); // wire type 0 = varint
     encode_varint(buf, val);
 }
 
 fn encode_field(buf: &mut Vec<u8>, field: u32, data: &[u8]) {
-    encode_varint(buf, ((field as u64) << 3) | 2); // wire type 2 = length-delimited
+    encode_varint(buf, (u64::from(field) << 3) | 2); // wire type 2 = length-delimited
     encode_varint(buf, data.len() as u64);
     buf.extend_from_slice(data);
 }
@@ -553,7 +572,7 @@ mod tests {
     fn unbiased_weight_converges() {
         // For size == interval, weight should be ~1/(1-e^{-1}) ≈ 1.58 → rounds to 2.
         let w = unbiased_weight(512 * 1024, 512 * 1024);
-        assert!(w >= 1 && w <= 3, "expected ~2, got {w}");
+        assert!((1..=3).contains(&w), "expected ~2, got {w}");
 
         // For very small size relative to interval, weight ≈ interval/size.
         let w_small = unbiased_weight(64, 512 * 1024);

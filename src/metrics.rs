@@ -172,6 +172,7 @@ impl PoolMetrics {
         // SAFETY: ptr is valid — the heap was just constructed and placed
         // at its final address. registry_idx is AtomicU32 so this write
         // through a shared reference is sound.
+        #[allow(clippy::cast_possible_truncation)]
         unsafe { &*ptr }.registry_idx.store(idx as u32, R);
     }
 
@@ -188,6 +189,7 @@ impl PoolMetrics {
             self.heap_ptrs[idx] = self.heap_ptrs[self.heap_count];
             // SAFETY: the moved entry's heap is alive and registered.
             // registry_idx is AtomicU32 so this write is sound.
+            #[allow(clippy::cast_possible_truncation)]
             unsafe { &*self.heap_ptrs[idx] }
                 .registry_idx
                 .store(idx as u32, R);
@@ -295,13 +297,15 @@ impl MetricsSnapshot {
     pub(crate) fn finalize(&mut self) {
         for i in 0..NUM_CLASSES {
             self.class_live_count[i] =
-                self.class_alloc_count[i] as i64 - self.class_dealloc_count[i] as i64;
+                self.class_alloc_count[i].cast_signed() - self.class_dealloc_count[i].cast_signed();
             self.class_live_bytes[i] =
-                self.class_alloc_bytes[i] as i64 - self.class_free_bytes[i] as i64;
+                self.class_alloc_bytes[i].cast_signed() - self.class_free_bytes[i].cast_signed();
         }
         self.allocated = self.alloc_bytes.saturating_sub(self.free_bytes);
     }
 
+    /// # Errors
+    /// Returns `core::fmt::Error` if writing to the formatter fails.
     // r[impl metrics.histogram-exposition]
     pub fn write_histogram(
         &self,

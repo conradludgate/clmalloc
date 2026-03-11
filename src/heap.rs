@@ -125,6 +125,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cfg(feature = "metrics")]
     #[inline(always)]
     pub(crate) fn metrics(&self) -> &crate::metrics::HeapMetrics {
+        // SAFETY: UnsafeCell allows shared access; we hold no &mut Heap.
         unsafe { &*self.metrics.get() }
     }
 
@@ -138,18 +139,16 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
 
     // r[impl heap.alloc-fast-path] r[impl heap.slab-request] r[impl heap.free-cache]
     // r[impl heap.page-queue]
+    #[allow(clippy::cast_possible_truncation)]
     #[inline]
     pub fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
-        let idx = match size_class::class_index(layout) {
-            Some(idx) => idx,
-            None => {
-                let ptr = self.pool.alloc_large(layout)?;
-                #[cfg(feature = "metrics")]
-                self.metrics().on_large_alloc(layout.size());
-                #[cfg(feature = "pprof")]
-                self.maybe_sample(ptr, layout.size(), u8::MAX);
-                return Some(ptr);
-            }
+        let Some(idx) = size_class::class_index(layout) else {
+            let ptr = self.pool.alloc_large(layout)?;
+            #[cfg(feature = "metrics")]
+            self.metrics().on_large_alloc(layout.size());
+            #[cfg(feature = "pprof")]
+            self.maybe_sample(ptr, layout.size(), u8::MAX);
+            return Some(ptr);
         };
 
         let class_size = size_class::class_size(idx);
@@ -202,6 +201,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         self.request_slab(idx, class_size)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     #[cold]
     #[inline(never)]
     fn request_slab(
@@ -218,6 +218,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             return Some(ptr);
         }
         let raw = self.pool.alloc_slab()?;
+        // SAFETY: raw is a valid, exclusively-owned slab page from the pool.
         let mut slab = unsafe { Slab::init(raw, class_idx as u8, self.id) };
         let ptr = slab.alloc();
         self.bins[class_idx] = Some(slab);
@@ -281,21 +282,20 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             crate::pprof::maybe_remove_sample(ptr.as_ptr());
         }
 
-        let idx = match size_class::class_index(layout) {
-            Some(idx) => idx,
-            None => {
-                #[cfg(feature = "metrics")]
-                self.metrics().on_large_dealloc(layout.size());
-                return unsafe { self.pool.dealloc_large(ptr, layout) };
-            }
+        let Some(idx) = size_class::class_index(layout) else {
+            #[cfg(feature = "metrics")]
+            self.metrics().on_large_dealloc(layout.size());
+            // SAFETY: ptr was allocated via alloc_large with the same layout.
+            return unsafe { self.pool.dealloc_large(ptr, layout) };
         };
 
         #[cfg(feature = "metrics")]
         self.metrics().on_dealloc(idx, size_class::class_size(idx));
 
         if let Some(active) = &mut self.bins[idx] {
+            // SAFETY: ptr was allocated from a slab of this class.
             let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
-            if active.as_ref().header_eq(&slab_ref) {
+            if active.as_ref().header_eq(slab_ref) {
                 active.dealloc_local(ptr);
                 return;
             }
@@ -319,6 +319,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             for heads in [&self.full_heads, &self.partial_heads] {
                 let mut cursor = heads[idx];
                 while let Some(base) = cursor {
+                    // SAFETY: base came from our full/partial list; slab is valid.
                     let mut slab = unsafe { Slab::from_raw(base) };
                     slab.drain_remote();
                     cursor = slab.next_link();
@@ -333,6 +334,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[inline(never)]
     fn try_partial(&mut self, class_idx: usize) -> bool {
         if let Some(base) = self.partial_heads[class_idx] {
+            // SAFETY: base came from our partial list; slab is valid.
             let mut slab = unsafe { Slab::from_raw(base) };
             self.partial_heads[class_idx] = slab.next_link();
             slab.set_next_link(None);
@@ -351,8 +353,9 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cold]
     #[inline(never)]
     fn scan_full_list(&mut self, class_idx: usize) {
-        let mut prev: *mut Option<NonNull<SlabBase>> = &mut self.full_heads[class_idx];
+        let mut prev: *mut Option<NonNull<SlabBase>> = &raw mut self.full_heads[class_idx];
         while let Some(base) = unsafe { *prev } {
+            // SAFETY: base came from our full list; slab is valid.
             let mut slab = unsafe { Slab::from_raw(base) };
             if !slab.has_pending_remote() {
                 prev = slab.next_link_mut();
@@ -361,11 +364,13 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             let next = slab.next_link();
             slab.drain_remote();
             if slab.is_fully_free() {
+                // SAFETY: prev points at a valid Option in full_heads.
                 unsafe { *prev = next };
                 self.pool.dealloc_slab(slab.into_raw());
                 continue;
             }
             if slab.free_count() > 0 {
+                // SAFETY: prev points at a valid Option in full_heads.
                 unsafe { *prev = next };
                 slab.set_next_link(None);
                 if self.bins[class_idx].is_none() {
@@ -405,6 +410,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         #[cfg(feature = "metrics")]
         // Field access (not method call) so the borrow checker sees
         // self.metrics and self.caches as disjoint borrows.
+        // SAFETY: UnsafeCell allows shared access; we hold no &mut Heap.
         unsafe { &*self.metrics.get() }.on_cache_flush(class_idx);
 
         // Sort entries by slab base so consecutive entries for the same slab
@@ -426,6 +432,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         let mut i = 0;
         while i < n {
             let slab_base_addr = entries[i].as_ptr() as usize & SLAB_MASK;
+            // SAFETY: slab_base_addr is slab-aligned; entries came from our allocator.
             let slab_base = unsafe { NonNull::new_unchecked(slab_base_addr as *mut SlabBase) };
 
             // Collect the run of entries for this slab.
@@ -436,9 +443,11 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             }
 
             // Check ownership via heap_id in the slab header.
+            // SAFETY: entries came from our allocator; ptr is interior to a slab.
             let slab_ref = unsafe { SlabRef::from_interior_ptr(entries[run_start].as_ptr()) };
             if slab_ref.heap_id() == self.id {
                 // Own slab: push each entry directly to the local free list.
+                // SAFETY: slab_base derived from entries; slab is valid.
                 let mut slab = unsafe { Slab::from_raw(slab_base) };
                 for e in &entries[run_start..i] {
                     slab.dealloc_local(*e);
@@ -446,8 +455,10 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             } else {
                 // Remote slab: chain entries and push the chain in one CAS.
                 #[cfg(feature = "metrics")]
+                // SAFETY: UnsafeCell allows shared access; we hold no &mut Heap.
                 unsafe { &*self.metrics.get() }.on_remote_free((i - run_start) as u64);
                 for j in run_start..i - 1 {
+                    // SAFETY: entries are valid alloc pointers; we write the free-list link.
                     unsafe { slab::write_next(entries[j], entries[j + 1].as_ptr()) };
                 }
                 slab_ref.push_chain_remote(entries[run_start], entries[i - 1]);
@@ -493,6 +504,7 @@ impl<P: PageAllocator> Drop for Heap<'_, P> {
             for heads in [&mut self.full_heads, &mut self.partial_heads] {
                 let mut cursor = heads[idx].take();
                 while let Some(base) = cursor {
+                    // SAFETY: base came from our full/partial list; slab is valid.
                     let mut slab = unsafe { Slab::from_raw(base) };
                     cursor = slab.next_link();
                     slab.set_next_link(None);
@@ -561,7 +573,7 @@ mod tests {
         let next = heap.alloc(layout).unwrap();
         let next_slab_ref = unsafe { SlabRef::from_interior_ptr(next.as_ptr()) };
         assert!(
-            !first_slab_ref.header_eq(&next_slab_ref),
+            !first_slab_ref.header_eq(next_slab_ref),
             "should be a different slab"
         );
 
@@ -683,7 +695,7 @@ mod tests {
         // Now a second slab becomes active.
         let second_ptr = heap.alloc(layout).unwrap();
         let second_slab = unsafe { SlabRef::from_interior_ptr(second_ptr.as_ptr()) };
-        assert!(!first_slab.header_eq(&second_slab));
+        assert!(!first_slab.header_eq(second_slab));
 
         // Free a pointer from the first (now retired) slab — goes to the cache.
         let cached = first_ptrs.pop().unwrap();
@@ -754,7 +766,7 @@ mod tests {
         let slab_ref1 = unsafe { SlabRef::from_interior_ptr(outstanding_ptr.as_ptr()) };
         let slab_ref2 = unsafe { SlabRef::from_interior_ptr(ptr2.as_ptr()) };
         assert!(
-            slab_ref1.header_eq(&slab_ref2),
+            slab_ref1.header_eq(slab_ref2),
             "heap2 should adopt heap1's slab"
         );
 
@@ -818,7 +830,7 @@ mod tests {
         let new_slab_ref = unsafe { SlabRef::from_interior_ptr(new_ptr.as_ptr()) };
         let old_slab_ref = unsafe { SlabRef::from_interior_ptr(raw_ptrs[0] as *const u8) };
         assert!(
-            old_slab_ref.header_eq(&new_slab_ref),
+            old_slab_ref.header_eq(new_slab_ref),
             "should adopt the abandoned slab"
         );
 
@@ -834,6 +846,7 @@ mod tests {
     #[cfg(feature = "metrics")]
     #[test]
     fn metrics_counter_accuracy() {
+        use core::sync::atomic::Ordering::Relaxed;
         let pool = pool();
         let mut heap = Heap::new(&pool);
         let layout = Layout::from_size_align(64, 1).unwrap();
@@ -842,7 +855,6 @@ mod tests {
 
         let p1 = heap.alloc(layout).unwrap();
         let p2 = heap.alloc(layout).unwrap();
-        use core::sync::atomic::Ordering::Relaxed;
         assert_eq!(heap.metrics().class_alloc_count[idx].load(Relaxed), 2);
         assert_eq!(heap.metrics().class_alloc_bytes[idx].load(Relaxed), 2 * cs);
         assert_eq!(heap.metrics().alloc_bytes.load(Relaxed), 2 * cs);
@@ -859,6 +871,8 @@ mod tests {
     #[cfg(feature = "metrics")]
     #[test]
     fn metrics_cache_hit_counted() {
+        use core::sync::atomic::Ordering::Relaxed;
+
         let pool = pool();
         let mut heap = Heap::new(&pool);
         let layout = Layout::from_size_align(64, 1).unwrap();
@@ -880,7 +894,6 @@ mod tests {
         let cached = first_ptrs.pop().unwrap();
         unsafe { heap.dealloc(cached, layout) };
 
-        use core::sync::atomic::Ordering::Relaxed;
         let before = heap.metrics().cache_hit_count[idx].load(Relaxed);
         // Alloc should hit the cache.
         let _recovered = heap.alloc(layout).unwrap();
@@ -894,11 +907,12 @@ mod tests {
     #[cfg(feature = "metrics")]
     #[test]
     fn metrics_large_alloc_tracked() {
+        use core::sync::atomic::Ordering::Relaxed;
+
         let pool = pool();
         let mut heap = Heap::new(&pool);
         let layout = Layout::from_size_align(1 << 20, 4096).unwrap();
         let ptr = heap.alloc(layout).unwrap();
-        use core::sync::atomic::Ordering::Relaxed;
         assert_eq!(heap.metrics().large_alloc_count.load(Relaxed), 1);
         assert_eq!(
             heap.metrics().large_alloc_bytes.load(Relaxed),
@@ -915,8 +929,8 @@ mod tests {
         let mut h1 = Heap::new(&pool);
         let mut h2 = Heap::new(&pool);
 
-        pool.register_heap(h1.metrics.get() as *const _);
-        pool.register_heap(h2.metrics.get() as *const _);
+        pool.register_heap(h1.metrics.get().cast_const());
+        pool.register_heap(h2.metrics.get().cast_const());
 
         let layout = Layout::from_size_align(64, 1).unwrap();
         let idx = size_class::class_index(layout).unwrap();
@@ -933,7 +947,7 @@ mod tests {
         unsafe { h1.dealloc(p1, layout) };
         unsafe { h2.dealloc(p2, layout) };
 
-        pool.deregister_heap(h1.metrics.get() as *const _);
-        pool.deregister_heap(h2.metrics.get() as *const _);
+        pool.deregister_heap(h1.metrics.get().cast_const());
+        pool.deregister_heap(h2.metrics.get().cast_const());
     }
 }

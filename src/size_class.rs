@@ -106,9 +106,8 @@ mod tests {
         for align_exp in 0..=12 {
             let align = 1usize << align_exp;
             for size in 1..=MAX_SLAB_SIZE {
-                let layout = match Layout::from_size_align(size, align) {
-                    Ok(l) => l,
-                    Err(_) => continue,
+                let Ok(layout) = Layout::from_size_align(size, align) else {
+                    continue;
                 };
                 if let Some(idx) = class_index(layout) {
                     let cs = class_size(idx);
@@ -122,6 +121,7 @@ mod tests {
     }
 
     // r[verify size-class.small]
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn small_class_waste_within_25_percent() {
         for size in 8..=1024 {
@@ -137,6 +137,7 @@ mod tests {
     }
 
     // r[verify size-class.medium]
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn medium_class_waste_within_25_percent() {
         for size in 1025..=MAX_SLAB_SIZE {

@@ -51,11 +51,15 @@ type Link = *mut u8;
 
 #[inline(always)]
 unsafe fn read_next(slot: NonNull<u8>) -> Link {
+    // SAFETY: Caller guarantees slot points to an allocated slot with at least
+    // pointer-sized bytes for the free-list link.
     unsafe { slot.as_ptr().cast::<Link>().read_unaligned() }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn write_next(slot: NonNull<u8>, next: Link) {
+    // SAFETY: Caller guarantees slot points to an allocated slot with at least
+    // pointer-sized bytes for the free-list link.
     unsafe { slot.as_ptr().cast::<Link>().write_unaligned(next) };
 }
 
@@ -88,15 +92,18 @@ struct SlabHeader {
 
 impl SlabHeader {
     // r[impl slab.bump-alloc]
+    #[allow(clippy::cast_possible_truncation)]
     unsafe fn init(base: NonNull<u8>, size_class_index: u8, heap_id: usize) -> NonNull<SlabHeader> {
         let slot_size = size_class::class_size(size_class_index as usize);
         debug_assert!(slot_size >= size_of::<Link>());
 
         let slots_offset = size_of::<Self>().next_multiple_of(slot_size);
         let slot_count = (SLAB_SIZE - slots_offset) / slot_size;
-        debug_assert!(slot_count > 0 && slot_count <= u16::MAX as usize);
+        debug_assert!(slot_count > 0 && u16::try_from(slot_count).is_ok());
 
         let header = base.as_ptr().cast::<SlabHeader>();
+        // SAFETY: base is a valid, exclusively-owned slab page; slot_size/slot_count/class
+        // are correct for the size class (validated by debug_assert above).
         unsafe {
             ptr::write(
                 header,
@@ -121,6 +128,8 @@ impl SlabHeader {
     }
 
     unsafe fn from_ptr(ptr: *const u8) -> NonNull<SlabHeader> {
+        // SAFETY: Caller guarantees ptr is within an allocated slab page; masking
+        // yields the slab base which holds a valid SlabHeader.
         unsafe { NonNull::new_unchecked((ptr as usize & SLAB_MASK) as *mut SlabHeader) }
     }
 }
@@ -155,6 +164,7 @@ impl Slab {
     ///   valid, writable memory.
     /// - No concurrent access to the region during init.
     pub unsafe fn init(base: NonNull<SlabBase>, size_class_index: u8, heap_id: usize) -> Slab {
+        // SAFETY: Caller guarantees base is valid, exclusively-owned slab memory.
         let header = unsafe { SlabHeader::init(base.cast(), size_class_index, heap_id) };
         Slab { header }
     }
@@ -192,6 +202,7 @@ impl Slab {
     }
 
     pub fn set_heap_id(&mut self, id: usize) {
+        // SAFETY: Slab owns the header; exclusive access via &mut self.
         unsafe { (*self.header.as_ptr()).heap_id = id };
     }
 
@@ -200,10 +211,12 @@ impl Slab {
     }
 
     pub(crate) fn set_next_link(&mut self, next: Option<NonNull<SlabBase>>) {
+        // SAFETY: Slab owns the header; exclusive access via &mut self.
         unsafe { (*self.header.as_ptr()).next_link = next };
     }
 
     pub(crate) fn next_link_mut(&mut self) -> &mut Option<NonNull<SlabBase>> {
+        // SAFETY: Slab owns the header; exclusive access via &mut self.
         unsafe { &mut (*self.header.as_ptr()).next_link }
     }
 
@@ -224,6 +237,7 @@ impl Slab {
     /// Free slots on the local list. Does not include remotely freed slots —
     /// call `drain_remote` first for a complete count.
     pub fn free_count(&self) -> u16 {
+        // SAFETY: with_mut provides exclusive access to LocalState.
         self.header().local.with_mut(|p| unsafe { (*p).free_count })
     }
 
@@ -239,12 +253,15 @@ impl Slab {
     /// cache-hot), then falls back to the bump pointer for virgin slots.
     #[inline]
     pub fn alloc(&mut self) -> Option<NonNull<u8>> {
+        // SAFETY: Slab owns the header; exclusive access via &mut self.
         let header = unsafe { &mut *self.header.as_ptr() };
 
         // Fast path: pop from the local free list (recycled slots).
         let ptr = header.local.with_mut(|p| {
+            // SAFETY: with_mut provides exclusive access to LocalState.
             let local = unsafe { &mut *p };
             let head = NonNull::new(local.head)?;
+            // SAFETY: head is from our free list, so it points to a valid slot.
             local.head = unsafe { read_next(head) };
             local.free_count -= 1;
             Some(head)
@@ -255,11 +272,14 @@ impl Slab {
 
         // Bump-pointer path: carve a fresh slot (no memory reads needed).
         if header.bump_remaining > 0 {
-            let base = self.header.as_ptr() as *mut u8;
+            let base = self.header.as_ptr().cast::<u8>();
+            // SAFETY: bump_cursor is within [slots_offset, SLAB_SIZE); base + offset is in slab.
             let slot = unsafe { base.add(header.bump_cursor as usize) };
             header.bump_cursor = header.bump_cursor.wrapping_add(header.slot_size);
             header.bump_remaining -= 1;
+            // SAFETY: with_mut provides exclusive access to LocalState.
             header.local.with_mut(|p| unsafe { (*p).free_count -= 1 });
+            // SAFETY: slot is within the slab's bump region, non-null.
             return Some(unsafe { NonNull::new_unchecked(slot) });
         }
 
@@ -271,11 +291,13 @@ impl Slab {
     #[inline]
     pub fn dealloc_local(&mut self, ptr: NonNull<u8>) {
         self.header().local.with_mut(|p| {
+            // SAFETY: with_mut provides exclusive access to LocalState.
             let local = unsafe { &mut *p };
+            // SAFETY: ptr was allocated from this slab; slot has space for link.
             unsafe { write_next(ptr, local.head) };
             local.head = ptr.as_ptr();
             local.free_count += 1;
-        })
+        });
     }
 
     /// True if the remote free list has pending entries. Cheaper than
@@ -293,11 +315,14 @@ impl Slab {
         let header = self.header();
         let chain = header.remote_head.swap(null_mut(), Ordering::Acquire);
         header.local.with_mut(|p| {
+            // SAFETY: with_mut provides exclusive access to LocalState.
             let local = unsafe { &mut *p };
             let mut count = 0u16;
             let mut cursor = chain;
             while let Some(slot) = NonNull::new(cursor) {
+                // SAFETY: slot is from remote list, valid allocated slot.
                 let next = unsafe { read_next(slot) };
+                // SAFETY: slot is from remote list, valid allocated slot.
                 unsafe { write_next(slot, local.head) };
                 local.head = cursor;
                 local.free_count += 1;
@@ -341,34 +366,35 @@ impl SlabRef {
     /// `ptr` must point within a live, initialized slab.
     #[inline]
     pub unsafe fn from_interior_ptr(ptr: *const u8) -> SlabRef {
+        // SAFETY: Caller guarantees ptr is within a live, initialized slab.
         SlabRef {
             header: unsafe { SlabHeader::from_ptr(ptr) },
         }
     }
 
     #[inline]
-    pub fn heap_id(&self) -> usize {
+    pub fn heap_id(self) -> usize {
         self.header().heap_id
     }
 
     /// True if two `SlabRef`s point to the same slab header.
     #[inline]
-    pub fn header_eq(&self, other: &SlabRef) -> bool {
+    pub fn header_eq(self, other: SlabRef) -> bool {
         self.header == other.header
     }
 
     #[expect(dead_code)]
-    pub fn slot_size(&self) -> usize {
+    pub fn slot_size(self) -> usize {
         self.header().slot_size as usize
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
-    pub fn slot_count(&self) -> usize {
+    pub fn slot_count(self) -> usize {
         self.header().slot_count as usize
     }
 
     #[expect(dead_code)]
-    pub fn size_class_index(&self) -> usize {
+    pub fn size_class_index(self) -> usize {
         self.header().size_class_index as usize
     }
 
@@ -380,6 +406,7 @@ impl SlabRef {
         let header = self.header();
         let mut head = header.remote_head.load(Ordering::Relaxed);
         loop {
+            // SAFETY: ptr was allocated from this slab; slot has space for link.
             unsafe { write_next(ptr, head) };
             match header.remote_head.compare_exchange_weak(
                 head,
@@ -400,6 +427,7 @@ impl SlabRef {
         let header = self.header();
         let mut head = header.remote_head.load(Ordering::Relaxed);
         loop {
+            // SAFETY: last was allocated from this slab; slot has space for link.
             unsafe { write_next(last, head) };
             match header.remote_head.compare_exchange_weak(
                 head,
@@ -430,11 +458,13 @@ mod tests {
         fn new(size_class_index: u8) -> Self {
             let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
             let ptr = unsafe {
+                // SAFETY: layout has valid size/align; alloc_zeroed returns valid or null.
                 let p = alloc_zeroed(layout);
                 NonNull::new(p)
                     .expect("aligned alloc failed")
                     .cast::<SlabBase>()
             };
+            // SAFETY: ptr is SLAB_SIZE-aligned, valid for SLAB_SIZE bytes.
             let slab = unsafe { Slab::init(ptr, size_class_index, 0) };
             Self { slab, ptr, layout }
         }
@@ -442,6 +472,7 @@ mod tests {
 
     impl Drop for TestSlab {
         fn drop(&mut self) {
+            // SAFETY: ptr and layout match the original alloc_zeroed call.
             unsafe { dealloc(self.ptr.as_ptr().cast(), self.layout) }
         }
     }
@@ -453,6 +484,7 @@ mod tests {
         let slot0 = t.slab.alloc().unwrap();
         let slot1 = t.slab.alloc().unwrap();
 
+        // SAFETY: slot0/slot1 are from t.slab.alloc(), interior to the slab.
         unsafe {
             let r0 = SlabRef::from_interior_ptr(slot0.as_ptr());
             let r1 = SlabRef::from_interior_ptr(slot1.as_ptr());
@@ -508,10 +540,9 @@ mod tests {
         // reasoning trick: PhantomData<Cell<()>> ensures !Sync.
         {
         }
+        fn assert_send_sync<T: Send + Sync>() {}
         assert_send::<Slab>();
         assert_not_sync::<Slab>();
-
-        fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SlabRef>();
     }
 
@@ -602,7 +633,7 @@ mod tests {
         }
 
         let drained = t.slab.drain_remote();
-        assert_eq!(drained, n as u16);
+        assert_eq!(drained, u16::try_from(n).unwrap());
 
         let mut recovered = HashSet::new();
         for _ in 0..n {
@@ -629,14 +660,17 @@ mod tests {
     fn into_raw_returns_base() {
         let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
         let base = unsafe {
+            // SAFETY: layout has valid size/align; alloc_zeroed returns valid or null.
             let p = alloc_zeroed(layout);
             NonNull::new(p)
                 .expect("aligned alloc failed")
                 .cast::<SlabBase>()
         };
+        // SAFETY: base is SLAB_SIZE-aligned, valid for SLAB_SIZE bytes.
         let slab = unsafe { Slab::init(base, 0, 0) };
         let returned = slab.into_raw();
         assert_eq!(returned, base);
+        // SAFETY: returned and layout match the original alloc.
         unsafe { dealloc(returned.as_ptr().cast(), layout) };
     }
 }
@@ -650,15 +684,18 @@ mod loom_tests {
     fn with_test_slab(size_class_index: u8, f: impl FnOnce(&mut Slab)) {
         let layout = Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap();
         let base = unsafe {
+            // SAFETY: layout has valid size/align; alloc_zeroed returns valid or null.
             let p = std::alloc::alloc_zeroed(layout);
             NonNull::new(p)
                 .expect("aligned alloc failed")
                 .cast::<SlabBase>()
         };
+        // SAFETY: base is SLAB_SIZE-aligned, valid for SLAB_SIZE bytes.
         let mut slab = unsafe { Slab::init(base, size_class_index, 0) };
         f(&mut slab);
         drop(slab);
         unsafe {
+            // SAFETY: base was initialized as SlabHeader; we manually drop before dealloc.
             ptr::drop_in_place(base.as_ptr().cast::<SlabHeader>());
             std::alloc::dealloc(base.as_ptr().cast(), layout);
         }
@@ -675,11 +712,13 @@ mod loom_tests {
 
                 let h1 = thread::spawn(move || {
                     let ptr = NonNull::new(r0 as *mut u8).unwrap();
+                    // SAFETY: ptr is from slab.alloc(), interior to the slab.
                     let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
                     slab_ref.dealloc_remote(ptr);
                 });
                 let h2 = thread::spawn(move || {
                     let ptr = NonNull::new(r1 as *mut u8).unwrap();
+                    // SAFETY: ptr is from slab.alloc(), interior to the slab.
                     let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
                     slab_ref.dealloc_remote(ptr);
                 });
@@ -702,6 +741,7 @@ mod loom_tests {
 
                 let h = thread::spawn(move || {
                     let ptr = NonNull::new(raw as *mut u8).unwrap();
+                    // SAFETY: ptr is from slab.alloc(), interior to the slab.
                     let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
                     slab_ref.dealloc_remote(ptr);
                 });
