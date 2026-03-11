@@ -12,7 +12,7 @@ use crate::slab::SLAB_SIZE;
 use crate::sys::PageAllocator;
 
 const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB = 32 slabs
-const MAX_SEGMENTS: usize = 256;
+const MAX_SEGMENTS: usize = 4096;
 
 #[repr(C, align(65536))]
 struct SlabPage([u8; SLAB_SIZE]);
@@ -77,10 +77,10 @@ impl<P: PageAllocator> PagePool<P> {
         if state.segment_cursor >= state.segment_end {
             let base = self.page_alloc.alloc(Layout::new::<Segment>())?;
             let segment = base.as_ptr().cast::<Segment>();
-            assert!(
-                state.segment_count < MAX_SEGMENTS,
-                "exceeded maximum segment count"
-            );
+            if state.segment_count >= MAX_SEGMENTS {
+                unsafe { self.page_alloc.dealloc(base, Layout::new::<Segment>()) };
+                return None;
+            }
             let idx = state.segment_count;
             state.segments[idx] = segment;
             state.segment_count = idx + 1;

@@ -130,11 +130,6 @@ fn warmup(
     }
 }
 
-// -- To benchmark clmalloc, uncomment:
-// use clmalloc::ClMalloc;
-// #[global_allocator]
-// static ALLOC: ClMalloc = ClMalloc;
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 

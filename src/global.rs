@@ -10,7 +10,7 @@ mod imp {
     use core::alloc::{GlobalAlloc, Layout};
     use core::mem::size_of;
     use core::ptr::{self, NonNull};
-    use std::sync::Once;
+    use core::sync::atomic::{AtomicIsize, Ordering};
 
     use crate::heap::Heap;
     use crate::pool::PagePool;
@@ -24,24 +24,44 @@ mod imp {
     /// preventing heap re-creation during late TLS teardown.
     const SENTINEL: *mut HeapTy = std::ptr::dangling_mut::<HeapTy>();
 
-    static KEY_ONCE: Once = Once::new();
-    static mut PTHREAD_KEY: libc::pthread_key_t = 0;
+    /// Atomic key storage: -1 = uninitialized, >= 0 = valid key.
+    /// Using atomics instead of `std::sync::Once` because `Once` may
+    /// internally allocate when parking contending threads, causing
+    /// reentrancy deadlock in the global allocator.
+    static PTHREAD_KEY: AtomicIsize = AtomicIsize::new(-1);
 
     // r[impl alloc.tls-pthread-cleanup]
     unsafe extern "C" fn heap_destructor(ptr: *mut libc::c_void) {
+        let key = PTHREAD_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
         if !ptr.is_null() && ptr != SENTINEL as *mut libc::c_void {
             unsafe { ptr::drop_in_place(ptr as *mut HeapTy) };
             unsafe { libc::free(ptr) };
         }
-        // Prevent re-creation if other TLS destructors call dealloc.
-        unsafe { libc::pthread_setspecific(PTHREAD_KEY, SENTINEL as *mut libc::c_void) };
+        unsafe { libc::pthread_setspecific(key, SENTINEL as *mut libc::c_void) };
     }
 
-    fn ensure_key() {
-        KEY_ONCE.call_once(|| {
-            let ret = unsafe { libc::pthread_key_create(&raw mut PTHREAD_KEY, Some(heap_destructor)) };
-            assert_eq!(ret, 0, "pthread_key_create failed");
-        });
+    fn get_key() -> libc::pthread_key_t {
+        let k = PTHREAD_KEY.load(Ordering::Acquire);
+        if k >= 0 {
+            return k as libc::pthread_key_t;
+        }
+        init_key()
+    }
+
+    #[cold]
+    fn init_key() -> libc::pthread_key_t {
+        let mut key: libc::pthread_key_t = 0;
+        let ret = unsafe { libc::pthread_key_create(&mut key, Some(heap_destructor)) };
+        assert_eq!(ret, 0, "pthread_key_create failed");
+
+        match PTHREAD_KEY.compare_exchange(-1, key as isize, Ordering::Release, Ordering::Acquire)
+        {
+            Ok(_) => key,
+            Err(existing) => {
+                unsafe { libc::pthread_key_delete(key) };
+                existing as libc::pthread_key_t
+            }
+        }
     }
 
     pub struct ClMalloc {
@@ -64,22 +84,22 @@ mod imp {
         // r[impl alloc.thread-local] r[impl alloc.tls-no-destructor]
         #[inline]
         fn get_heap(&'static self) -> *mut HeapTy {
-            ensure_key();
-            let ptr = unsafe { libc::pthread_getspecific(PTHREAD_KEY) } as *mut HeapTy;
+            let key = get_key();
+            let ptr = unsafe { libc::pthread_getspecific(key) } as *mut HeapTy;
             if ptr.is_null() {
-                return self.init_heap();
+                return self.init_heap(key);
             }
             ptr
         }
 
         #[cold]
-        fn init_heap(&'static self) -> *mut HeapTy {
+        fn init_heap(&'static self, key: libc::pthread_key_t) -> *mut HeapTy {
             let ptr = unsafe { libc::malloc(size_of::<HeapTy>()) } as *mut HeapTy;
             if ptr.is_null() {
                 return ptr;
             }
             unsafe { ptr::write(ptr, Heap::new(&self.pool)) };
-            unsafe { libc::pthread_setspecific(PTHREAD_KEY, ptr as *mut libc::c_void) };
+            unsafe { libc::pthread_setspecific(key, ptr as *mut libc::c_void) };
             ptr
         }
     }
