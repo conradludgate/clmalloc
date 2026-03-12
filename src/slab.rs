@@ -178,6 +178,9 @@ struct SlabHeader {
     // r[impl heap.identity]
     heap_id: usize,
     next_link: Option<NonNull<SlabBase>>,
+    /// Points to the previous node's `next_link` field (or the list head).
+    /// Null when the slab is not in any list.
+    prev_link: *mut Option<NonNull<SlabBase>>,
     // r[impl slab.bump-alloc]
     /// Byte offset of the next slot to carve from the bump region.
     /// Once `bump_remaining == 0`, all slots have been carved and
@@ -186,9 +189,21 @@ struct SlabHeader {
     bump_remaining: u16,
     // r[impl slab.local-freelist] r[impl slab.local-no-atomics]
     local: UnsafeCell<SlotFreeList>,
+    // Cache-line boundary: `local` (offset 0x28) and `remote` (offset 0x40)
+    // must be on different 64-byte cache lines. Without this pad, a remote
+    // CAS on `remote.head` invalidates the line holding `local.head`,
+    // stalling every local alloc with a cache miss.
+    _remote_pad: [u8; 8],
     // r[impl slab.remote-freelist]
     remote: TreiberStack,
 }
+
+const _: () = {
+    assert!(
+        core::mem::offset_of!(SlabHeader, remote) >= 64,
+        "remote must be on a different cache line from local"
+    );
+};
 
 impl SlabHeader {
     // r[impl slab.bump-alloc]
@@ -216,9 +231,11 @@ impl SlabHeader {
                     size_class_index,
                     heap_id,
                     next_link: None,
+                    prev_link: null_mut(),
                     bump_cursor: slots_offset as u16,
                     bump_remaining: slot_count as u16,
                     local: UnsafeCell::new(SlotFreeList::EMPTY),
+                    _remote_pad: [0; 8],
                     remote: TreiberStack::new(),
                 },
             );
@@ -314,9 +331,18 @@ impl Slab {
         unsafe { (*self.header.as_ptr()).next_link = next };
     }
 
-    pub(crate) fn next_link_mut(&mut self) -> &mut Option<NonNull<SlabBase>> {
+    pub(crate) fn next_link_ptr(&mut self) -> *mut Option<NonNull<SlabBase>> {
         // SAFETY: Slab owns the header; exclusive access via &mut self.
-        unsafe { &mut (*self.header.as_ptr()).next_link }
+        unsafe { &raw mut (*self.header.as_ptr()).next_link }
+    }
+
+    pub(crate) fn prev_link(&self) -> *mut Option<NonNull<SlabBase>> {
+        self.header().prev_link
+    }
+
+    pub(crate) fn set_prev_link(&mut self, prev: *mut Option<NonNull<SlabBase>>) {
+        // SAFETY: Slab owns the header; exclusive access via &mut self.
+        unsafe { (*self.header.as_ptr()).prev_link = prev };
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
@@ -494,22 +520,32 @@ impl SlabRef {
     }
 
     /// Push a pre-chained list `[first -> ... -> last]` onto the remote
-    /// free list in a single CAS. Used by the free cache flush to batch
-    /// multiple frees into one atomic operation per slab.
+    /// free list in a single CAS.
+    #[allow(dead_code)]
     pub fn push_chain_remote(self, first: NonNull<u8>, last: NonNull<u8>) {
         self.header().remote.push_chain(first, last);
     }
 }
 
 // ---------------------------------------------------------------------------
-// SlabList — intrusive singly-linked list of slabs via next_link
+// SlabList — intrusive doubly-linked list of slabs
 // ---------------------------------------------------------------------------
+//
+// Each node stores `next_link` (forward pointer) and `prev_link` (pointer to
+// the predecessor's `next_link` field, or to the list head). This enables
+// O(1) removal from any position without knowing which list the slab is in.
 
 pub(crate) type SlabList = Option<NonNull<SlabBase>>;
 
-/// Push a slab onto the head of a slab list, consuming the owner handle.
+/// Push a slab onto the head of a slab list.
 pub(crate) fn slab_list_push(head: &mut SlabList, mut slab: Slab) {
     slab.set_next_link(*head);
+    slab.set_prev_link(core::ptr::from_mut(head));
+    if let Some(old_head) = *head {
+        // SAFETY: old_head is in the list and has a valid header.
+        let mut old = unsafe { Slab::from_raw(old_head) };
+        old.set_prev_link(slab.next_link_ptr());
+    }
     *head = Some(slab.into_raw());
 }
 
@@ -519,48 +555,35 @@ pub(crate) fn slab_list_pop(head: &mut SlabList) -> Option<Slab> {
     // SAFETY: base was put into the list via slab_list_push / into_raw.
     let mut slab = unsafe { Slab::from_raw(base) };
     *head = slab.next_link();
+    if let Some(new_head) = *head {
+        // SAFETY: new_head is in the list and has a valid header.
+        let mut new = unsafe { Slab::from_raw(new_head) };
+        new.set_prev_link(core::ptr::from_mut(head));
+    }
     slab.set_next_link(None);
+    slab.set_prev_link(null_mut());
     Some(slab)
 }
 
-/// Cursor for in-place traversal and removal on a slab chain.
+/// Remove a slab from whatever doubly-linked list it belongs to. O(1).
 ///
-/// # Safety
-///
-/// The raw pointer `prev` must remain valid and unaliased for the
-/// cursor's lifetime. The caller must not access the list head through
-/// any other path while the cursor is live.
-pub(crate) struct SlabListCursor {
-    prev: *mut SlabList,
-}
+/// After removal, the slab's `next_link` and `prev_link` are cleared.
+/// The slab must currently be in a list (`prev_link` must be non-null).
+pub(crate) fn slab_list_remove(slab: &mut Slab) {
+    let prev = slab.prev_link();
+    debug_assert!(!prev.is_null(), "slab_list_remove on slab not in a list");
 
-impl SlabListCursor {
-    /// # Safety
-    ///
-    /// `head` must point to a valid `SlabList` that remains live and
-    /// unaliased for the lifetime of the cursor.
-    pub unsafe fn new(head: *mut SlabList) -> Self {
-        Self { prev: head }
+    let next = slab.next_link();
+    // SAFETY: prev points to the predecessor's next_link field (or the
+    // list head), which is valid while the list exists.
+    unsafe { *prev = next };
+    if let Some(next_base) = next {
+        // SAFETY: next_base is in the list and has a valid header.
+        let mut next_slab = unsafe { Slab::from_raw(next_base) };
+        next_slab.set_prev_link(prev);
     }
-
-    pub fn current(&self) -> Option<NonNull<SlabBase>> {
-        // SAFETY: prev is valid per construction invariant.
-        unsafe { *self.prev }
-    }
-
-    /// Remove the current node from the list and advance to its successor.
-    /// `slab` must be the owner handle for the current node.
-    pub fn remove_current(&mut self, slab: &Slab) {
-        let next = slab.next_link();
-        // SAFETY: prev is valid per construction invariant.
-        unsafe { *self.prev = next };
-    }
-
-    /// Advance past the current node, keeping it in the list.
-    /// `slab` must be the owner handle for the current node.
-    pub fn advance(&mut self, slab: &mut Slab) {
-        self.prev = slab.next_link_mut();
-    }
+    slab.set_next_link(None);
+    slab.set_prev_link(null_mut());
 }
 
 #[cfg(all(test, not(loom)))]

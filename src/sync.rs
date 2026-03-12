@@ -5,10 +5,10 @@
 //! types with a matching API.
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicPtr, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 #[cfg(not(loom))]
-pub(crate) use core::sync::atomic::{AtomicPtr, Ordering};
+pub(crate) use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 #[cfg(loom)]
 pub(crate) use loom::cell::UnsafeCell;

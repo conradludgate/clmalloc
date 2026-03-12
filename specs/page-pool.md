@@ -10,11 +10,22 @@ The page pool MUST provide slabs of the requested size, properly aligned
 to the slab size boundary (for pointer masking).
 
 r[pool.thread-safe]
-The page pool MUST be safe to access from any thread. It MUST use a
-low-contention lock (e.g. spin lock). Lock-free pop from a shared slab
-cache is not viable due to data races on intrusive next-pointers; this
-is consistent with jemalloc, tcmalloc, and mimalloc which all use locks
-for their shared page/extent caches.
+The page pool MUST be safe to access from any thread. Free slab lists
+and segment carving MUST use a low-contention lock (e.g. spin lock).
+Abandoned slab lists use lock-free atomic operations (see
+`pool.lockfree-abandon`).
+
+r[pool.lockfree-abandon]
+Abandoned slab lists MUST use lock-free atomic push (CAS) per size class
+for `abandon_slab`, and bulk drain (atomic swap) for `adopt_all`. This
+avoids acquiring the pool mutex during thread exit/start churn.
+
+r[pool.slab-cache]
+The pool MUST maintain a lock-free cache (Treiber stack) of fully-free
+slab pages. `cache_slab` pushes via CAS, `uncache_slab` pops via CAS.
+When the cache exceeds a capacity limit, overflow slabs fall through to
+the mutex-guarded `dealloc_slab`. Cached slabs remain counted as
+outstanding in their segment, preventing premature segment release.
 
 ## OS memory
 

@@ -12,11 +12,10 @@
 //! empty, the heap scans the full queue in one pass, draining remote frees
 //! and collecting all newly-partial slabs. This amortises the scan cost.
 //!
-//! A per-size-class free cache (inspired by jemalloc's tcache) absorbs
-//! alloc/free pairs without touching shared state. Non-active-slab frees
-//! are pushed into the cache (no atomics); allocs pop from the cache first.
-//! The cache is flushed in batch on overflow or thread exit, amortising
-//! the cost of atomic CAS operations across many frees.
+//! Deallocation pushes directly to the slab that owns the pointer:
+//! own-slab frees go to the local free list (no atomics), remote-slab
+//! frees go to the slab's Treiber stack (one CAS). This matches
+//! mimalloc's model — every dealloc is O(1) with no batching.
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
@@ -25,8 +24,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::pool::PagePool;
 use crate::size_class::{self, NUM_CLASSES};
 use crate::slab::{
-    self, SLAB_MASK, Slab, SlabBase, SlabList, SlabListCursor, SlabRef, slab_list_pop,
-    slab_list_push,
+    SLAB_MASK, Slab, SlabBase, SlabList, SlabRef, slab_list_pop, slab_list_push, slab_list_remove,
 };
 use crate::sys::PageAllocator;
 
@@ -34,44 +32,6 @@ static NEXT_HEAP_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn next_heap_id() -> usize {
     NEXT_HEAP_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-// -- Free cache (tcache) -----------------------------------------------------
-
-const CACHE_CAP: usize = 64;
-
-// r[impl heap.free-cache]
-struct FreeCache {
-    entries: [NonNull<u8>; CACHE_CAP],
-    count: u8,
-}
-
-impl FreeCache {
-    const EMPTY: Self = Self {
-        entries: [NonNull::dangling(); CACHE_CAP],
-        count: 0,
-    };
-
-    #[inline]
-    fn pop(&mut self) -> Option<NonNull<u8>> {
-        if self.count == 0 {
-            return None;
-        }
-        self.count -= 1;
-        Some(self.entries[self.count as usize])
-    }
-
-    #[inline]
-    fn push(&mut self, ptr: NonNull<u8>) {
-        debug_assert!((self.count as usize) < CACHE_CAP);
-        self.entries[self.count as usize] = ptr;
-        self.count += 1;
-    }
-
-    #[inline]
-    fn is_full(&self) -> bool {
-        self.count as usize >= CACHE_CAP
-    }
 }
 
 // -- Heap --------------------------------------------------------------------
@@ -85,7 +45,6 @@ pub struct Heap<'pool, P: PageAllocator> {
     // r[impl heap.page-queue]
     full_heads: [SlabList; NUM_CLASSES],
     partial_heads: [SlabList; NUM_CLASSES],
-    caches: [FreeCache; NUM_CLASSES],
     #[cfg(feature = "metrics")]
     pub(crate) metrics: core::cell::UnsafeCell<crate::metrics::HeapMetrics>,
     // r[impl pprof.feature-gate]
@@ -104,7 +63,6 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             bins: [NONE; NUM_CLASSES],
             full_heads: [None; NUM_CLASSES],
             partial_heads: [None; NUM_CLASSES],
-            caches: [FreeCache::EMPTY; NUM_CLASSES],
             #[cfg(feature = "metrics")]
             metrics: core::cell::UnsafeCell::new(crate::metrics::HeapMetrics::ZERO),
             #[cfg(feature = "pprof")]
@@ -141,7 +99,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         }
     }
 
-    // r[impl heap.alloc-fast-path] r[impl heap.slab-request] r[impl heap.free-cache]
+    // r[impl heap.alloc-fast-path] r[impl heap.slab-request]
     // r[impl heap.page-queue]
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
@@ -156,17 +114,6 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         };
 
         let class_size = size_class::class_size(idx);
-
-        if let Some(ptr) = self.caches[idx].pop() {
-            #[cfg(feature = "metrics")]
-            {
-                self.metrics().on_alloc(idx, class_size);
-                self.metrics().on_cache_hit(idx);
-            }
-            #[cfg(feature = "pprof")]
-            self.maybe_sample(ptr, class_size, idx as u8);
-            return Some(ptr);
-        }
 
         if let Some(slab) = &mut self.bins[idx] {
             if let Some(ptr) = slab.alloc() {
@@ -186,8 +133,6 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             }
             self.retire_active(idx);
         }
-
-        self.flush_cache(idx);
 
         if self.try_partial(idx) {
             return self.alloc(layout);
@@ -221,7 +166,10 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
             self.maybe_sample(ptr, class_size, class_idx as u8);
             return Some(ptr);
         }
-        let raw = self.pool.alloc_slab()?;
+        let raw = self
+            .pool
+            .uncache_slab()
+            .or_else(|| self.pool.alloc_slab())?;
         // SAFETY: raw is a valid, exclusively-owned slab page from the pool.
         let mut slab = unsafe { Slab::init(raw, class_idx as u8, self.id) };
         let ptr = slab.alloc();
@@ -241,38 +189,36 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[inline(never)]
     // r[impl heap.abandon] r[impl heap.eager-adopt]
     fn try_adopt(&mut self, class_idx: usize) -> Option<NonNull<u8>> {
-        // Eagerly adopt ALL abandoned slabs for this class. This ensures
-        // that frees to any of them are local (heap_id matches), avoiding
-        // atomic CAS on the remote free list. Critical for workloads like
-        // Larson where a successor thread inherits its predecessor's
-        // allocations after the predecessor has exited.
+        // Bulk-adopt all abandoned slabs for this class in a single atomic
+        // swap, then walk the chain locally — no further lock acquisitions.
+        let mut slab_opt = self.pool.adopt_all(class_idx);
         let mut result: Option<NonNull<u8>> = None;
-        while let Some(mut slab) = self.pool.adopt_slab(class_idx) {
+        while let Some(mut slab) = slab_opt {
+            let next = slab.next_link();
+            slab.set_next_link(None);
+            slab.set_prev_link(core::ptr::null_mut());
             slab.set_heap_id(self.id);
             slab.drain_remote();
+            #[cfg(feature = "metrics")]
+            self.pool.inc_adopt_count(class_idx);
             if slab.is_fully_free() {
-                self.pool.dealloc_slab(slab.into_raw());
-                continue;
-            }
-            if result.is_none()
+                self.pool.cache_slab(slab.into_raw());
+            } else if result.is_none()
                 && let Some(ptr) = slab.alloc()
             {
                 self.bins[class_idx] = Some(slab);
                 result = Some(ptr);
-                continue;
-            }
-            // Partial or full — put on the appropriate list so frees
-            // to this slab are local (heap_id is ours).
-            if slab.free_count() > 0 {
+            } else if slab.free_count() > 0 {
                 slab_list_push(&mut self.partial_heads[class_idx], slab);
             } else {
                 slab_list_push(&mut self.full_heads[class_idx], slab);
             }
+            slab_opt = next.map(|b| unsafe { Slab::from_raw(b) });
         }
         result
     }
 
-    // r[impl heap.dealloc-o1] r[impl heap.free-cache]
+    // r[impl heap.dealloc-o1]
     #[inline]
     /// # Safety
     /// - `ptr` must have been returned by `alloc` on some `Heap` sharing the
@@ -294,27 +240,46 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         #[cfg(feature = "metrics")]
         self.metrics().on_dealloc(idx, size_class::class_size(idx));
 
-        if let Some(active) = &mut self.bins[idx] {
-            // SAFETY: ptr was allocated from a slab of this class.
-            let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
-            if active.as_ref().header_eq(slab_ref) {
-                active.dealloc_local(ptr);
-                return;
-            }
+        // SAFETY: ptr was allocated from a slab of this class.
+        let slab_ref = unsafe { SlabRef::from_interior_ptr(ptr.as_ptr()) };
+
+        // Fast path: active slab — local free list, no atomics.
+        if let Some(active) = &mut self.bins[idx]
+            && active.as_ref().header_eq(slab_ref)
+        {
+            active.dealloc_local(ptr);
+            return;
         }
 
-        if self.caches[idx].is_full() {
-            self.flush_cache(idx);
-            self.collect_full_list(idx);
+        // Own slab (non-active): local free list, no atomics.
+        if slab_ref.heap_id() == self.id {
+            let slab_base_addr = ptr.as_ptr() as usize & SLAB_MASK;
+            // SAFETY: slab_base_addr is slab-aligned; ptr belongs to a valid slab.
+            let slab_base = unsafe { NonNull::new_unchecked(slab_base_addr as *mut SlabBase) };
+            let mut slab = unsafe { Slab::from_raw(slab_base) };
+            slab.dealloc_local(ptr);
+            if slab.is_fully_free() {
+                self.reclaim_slab(slab_base);
+            } else if slab.free_count() == 1 {
+                // r[impl heap.dealloc-promote]
+                slab_list_remove(&mut slab);
+                if self.bins[idx].is_none() {
+                    self.bins[idx] = Some(slab);
+                } else {
+                    slab_list_push(&mut self.partial_heads[idx], slab);
+                }
+            }
+            return;
         }
-        self.caches[idx].push(ptr);
+
+        // Remote slab: one atomic CAS push.
+        #[cfg(feature = "metrics")]
+        self.metrics().on_remote_free(1);
+        slab_ref.dealloc_remote(ptr);
     }
 
     #[cfg(test)]
     fn drain_remote_all(&mut self) {
-        for idx in 0..NUM_CLASSES {
-            self.flush_cache(idx);
-        }
         for slab in self.bins.iter_mut().flatten() {
             slab.drain_remote();
         }
@@ -352,56 +317,39 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
     #[cold]
     #[inline(never)]
     fn scan_full_list(&mut self, class_idx: usize) {
-        // SAFETY: pointer to full_heads element; no aliasing access during iteration.
-        let mut cursor = unsafe { SlabListCursor::new(&raw mut self.full_heads[class_idx]) };
-        while let Some(base) = cursor.current() {
+        let mut current = self.full_heads[class_idx];
+        while let Some(base) = current {
             // SAFETY: base came from our full list; slab is valid.
             let mut slab = unsafe { Slab::from_raw(base) };
-            if !slab.has_pending_remote() {
-                cursor.advance(&mut slab);
-                continue;
+            current = slab.next_link();
+            if slab.has_pending_remote() {
+                slab.drain_remote();
             }
-            slab.drain_remote();
             if slab.is_fully_free() {
-                cursor.remove_current(&slab);
-                self.pool.dealloc_slab(slab.into_raw());
+                slab_list_remove(&mut slab);
+                self.pool.cache_slab(slab.into_raw());
                 continue;
             }
             if slab.free_count() > 0 {
-                cursor.remove_current(&slab);
-                slab.set_next_link(None);
+                slab_list_remove(&mut slab);
                 if self.bins[class_idx].is_none() {
                     self.bins[class_idx] = Some(slab);
                 } else {
                     slab_list_push(&mut self.partial_heads[class_idx], slab);
                 }
-                continue;
             }
-            cursor.advance(&mut slab);
         }
     }
 
-    /// Walk the full list after a cache flush, returning fully-free slabs
-    /// to the pool. Unlike `scan_full_list`, this runs on the dealloc path
-    /// and does not promote partial slabs — it only reclaims empty ones.
+    /// Unlink a fully-free non-active slab and return it to the cache/pool.
+    /// O(1) via doubly-linked list removal.
     #[cold]
     #[inline(never)]
-    fn collect_full_list(&mut self, class_idx: usize) {
-        // SAFETY: pointer to full_heads element; no aliasing access during iteration.
-        let mut cursor = unsafe { SlabListCursor::new(&raw mut self.full_heads[class_idx]) };
-        while let Some(base) = cursor.current() {
-            // SAFETY: base came from our full list; slab is valid.
-            let mut slab = unsafe { Slab::from_raw(base) };
-            if slab.has_pending_remote() {
-                slab.drain_remote();
-            }
-            if slab.is_fully_free() {
-                cursor.remove_current(&slab);
-                self.pool.dealloc_slab(slab.into_raw());
-                continue;
-            }
-            cursor.advance(&mut slab);
-        }
+    fn reclaim_slab(&mut self, target: NonNull<SlabBase>) {
+        // SAFETY: target points to a valid slab that is in one of our lists.
+        let mut slab = unsafe { Slab::from_raw(target) };
+        slab_list_remove(&mut slab);
+        self.pool.cache_slab(slab.into_raw());
     }
 
     /// Move the exhausted active slab to the full list for its class.
@@ -413,88 +361,6 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         }
     }
 
-    /// Flush the free cache for `class_idx`, returning cached pointers to
-    /// their owning slabs. Own-slab entries go directly to the local free
-    /// list (no atomics); remote entries are chained per-slab and pushed
-    /// with a single CAS each.
-    #[cold]
-    #[inline(never)]
-    fn flush_cache(&mut self, class_idx: usize) {
-        let n = self.caches[class_idx].count as usize;
-        if n == 0 {
-            return;
-        }
-
-        #[cfg(feature = "metrics")]
-        // Field access (not method call) so the borrow checker sees
-        // self.metrics and self.caches as disjoint borrows.
-        // SAFETY: UnsafeCell allows shared access; we hold no &mut Heap.
-        unsafe { &*self.metrics.get() }.on_cache_flush(class_idx);
-
-        // Sort entries by slab base so consecutive entries for the same slab
-        // are adjacent. Insertion sort is fine for <=64 elements.
-        let entries = &mut self.caches[class_idx].entries[..n];
-        for i in 1..n {
-            let key = entries[i];
-            let mut j = i;
-            while j > 0
-                && (entries[j - 1].as_ptr() as usize & SLAB_MASK)
-                    > (key.as_ptr() as usize & SLAB_MASK)
-            {
-                entries[j] = entries[j - 1];
-                j -= 1;
-            }
-            entries[j] = key;
-        }
-
-        let mut i = 0;
-        while i < n {
-            let slab_base_addr = entries[i].as_ptr() as usize & SLAB_MASK;
-            // SAFETY: slab_base_addr is slab-aligned; entries came from our allocator.
-            let slab_base = unsafe { NonNull::new_unchecked(slab_base_addr as *mut SlabBase) };
-
-            // Collect the run of entries for this slab.
-            let run_start = i;
-            i += 1;
-            while i < n && (entries[i].as_ptr() as usize & SLAB_MASK) == slab_base_addr {
-                i += 1;
-            }
-
-            // Check ownership via heap_id in the slab header.
-            // SAFETY: entries came from our allocator; ptr is interior to a slab.
-            let slab_ref = unsafe { SlabRef::from_interior_ptr(entries[run_start].as_ptr()) };
-            if slab_ref.heap_id() == self.id {
-                // Own slab: push each entry directly to the local free list.
-                // SAFETY: slab_base derived from entries; slab is valid.
-                let mut slab = unsafe { Slab::from_raw(slab_base) };
-                for e in &entries[run_start..i] {
-                    slab.dealloc_local(*e);
-                }
-            } else {
-                // Remote slab: chain entries and push the chain in one CAS.
-                #[cfg(feature = "metrics")]
-                // SAFETY: UnsafeCell allows shared access; we hold no &mut Heap.
-                unsafe { &*self.metrics.get() }.on_remote_free((i - run_start) as u64);
-                for j in run_start..i - 1 {
-                    // SAFETY: entries are valid alloc pointers; we write the free-list link.
-                    unsafe { slab::write_next(entries[j], entries[j + 1].as_ptr()) };
-                }
-                slab_ref.push_chain_remote(entries[run_start], entries[i - 1]);
-            }
-        }
-
-        self.caches[class_idx].count = 0;
-
-        // Speculatively drain remote frees on the active slab. If the
-        // caller is about to exhaust the slab and enter promote_retired,
-        // this can recover slots and avoid the retired list walk entirely.
-        if let Some(slab) = &mut self.bins[class_idx]
-            && slab.has_pending_remote()
-        {
-            slab.drain_remote();
-        }
-    }
-
     /// Retire the active slab during thread exit. Fully-free slabs go back
     /// to the pool; partially-used slabs are abandoned for adoption.
     #[cold]
@@ -503,7 +369,7 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
         if let Some(mut slab) = self.bins[class_idx].take() {
             slab.drain_remote();
             if slab.is_fully_free() {
-                self.pool.dealloc_slab(slab.into_raw());
+                self.pool.cache_slab(slab.into_raw());
             } else {
                 // r[impl heap.abandon]
                 self.pool.abandon_slab(slab);
@@ -516,14 +382,12 @@ impl<'pool, P: PageAllocator> Heap<'pool, P> {
 impl<P: PageAllocator> Drop for Heap<'_, P> {
     fn drop(&mut self) {
         for idx in 0..NUM_CLASSES {
-            self.flush_cache(idx);
             self.retire_slab(idx);
-            // Drain both full and partial lists.
             for heads in [&mut self.full_heads, &mut self.partial_heads] {
                 while let Some(mut slab) = slab_list_pop(&mut heads[idx]) {
                     slab.drain_remote();
                     if slab.is_fully_free() {
-                        self.pool.dealloc_slab(slab.into_raw());
+                        self.pool.cache_slab(slab.into_raw());
                     } else {
                         // r[impl heap.abandon]
                         self.pool.abandon_slab(slab);
@@ -668,7 +532,7 @@ mod tests {
             slab2_ptrs.push(heap.alloc(layout).unwrap());
         }
 
-        // Next alloc: no active slab, cache empty, partial queue empty.
+        // Next alloc: no active slab, partial queue empty.
         // scan_full_list drains slab 1's remote free → slab 1 becomes partial
         // → promoted to active → alloc succeeds from slab 1.
         let recovered = heap.alloc(layout).unwrap();
@@ -743,14 +607,13 @@ mod tests {
         unsafe { heap.dealloc(recovered, layout) };
     }
 
-    // r[verify heap.free-cache]
+    // r[verify heap.dealloc-o1]
     #[test]
-    fn free_cache_absorbs_non_active_slab_frees() {
+    fn dealloc_non_active_own_slab_goes_to_local_free_list() {
         let pool = pool();
         let mut heap = Heap::new(&pool);
         let layout = Layout::from_size_align(64, 1).unwrap();
 
-        // Fill the first slab to force a second one.
         let first_ptr = heap.alloc(layout).unwrap();
         let first_slab = unsafe { SlabRef::from_interior_ptr(first_ptr.as_ptr()) };
         let slot_count = first_slab.slot_count();
@@ -760,41 +623,93 @@ mod tests {
             first_ptrs.push(heap.alloc(layout).unwrap());
         }
 
-        // Now a second slab becomes active.
+        // Second slab becomes active.
         let second_ptr = heap.alloc(layout).unwrap();
         let second_slab = unsafe { SlabRef::from_interior_ptr(second_ptr.as_ptr()) };
         assert!(!first_slab.header_eq(second_slab));
 
-        // Free a pointer from the first (now retired) slab — goes to the cache.
-        let cached = first_ptrs.pop().unwrap();
-        let cached_addr = cached.as_ptr() as usize;
-        unsafe { heap.dealloc(cached, layout) };
+        // Free from non-active own slab → pushed to local free list,
+        // and slab promoted from full to partial queue (free_count 0→1).
+        let freed = first_ptrs.pop().unwrap();
+        let freed_addr = freed.as_ptr() as usize;
+        unsafe { heap.dealloc(freed, layout) };
 
-        // Alloc should return the cached pointer immediately.
+        // Exhaust the second slab.
+        let mut second_ptrs = vec![second_ptr];
+        for _ in 1..slot_count {
+            second_ptrs.push(heap.alloc(layout).unwrap());
+        }
+
+        // Alloc path: slab2 exhausted → retire → try_partial finds
+        // slab1 (promoted during dealloc) → alloc returns freed slot.
         let recovered = heap.alloc(layout).unwrap();
-        assert_eq!(recovered.as_ptr() as usize, cached_addr);
+        assert_eq!(recovered.as_ptr() as usize, freed_addr);
 
-        // Clean up.
         unsafe { heap.dealloc(recovered, layout) };
-        unsafe { heap.dealloc(second_ptr, layout) };
         for ptr in first_ptrs {
+            unsafe { heap.dealloc(ptr, layout) };
+        }
+        for ptr in second_ptrs {
             unsafe { heap.dealloc(ptr, layout) };
         }
     }
 
-    // r[verify heap.free-cache]
+    // r[verify heap.dealloc-promote]
     #[test]
-    fn free_cache_flush_returns_to_slabs() {
+    fn dealloc_promotes_full_slab_to_partial() {
+        let pool = pool();
+        let mut heap = Heap::new(&pool);
+        let layout = Layout::from_size_align(64, 1).unwrap();
+
+        // Fill slab1 completely → retired to full queue.
+        let first_ptr = heap.alloc(layout).unwrap();
+        let first_slab = unsafe { SlabRef::from_interior_ptr(first_ptr.as_ptr()) };
+        let slot_count = first_slab.slot_count();
+        let mut first_ptrs = vec![first_ptr];
+        for _ in 1..slot_count {
+            first_ptrs.push(heap.alloc(layout).unwrap());
+        }
+
+        // Slab2 becomes active; exhaust it completely.
+        let mut second_ptrs = Vec::new();
+        for _ in 0..slot_count {
+            second_ptrs.push(heap.alloc(layout).unwrap());
+        }
+        let second_slab = unsafe { SlabRef::from_interior_ptr(second_ptrs[0].as_ptr()) };
+        assert!(!first_slab.header_eq(second_slab));
+
+        // Free one slot from slab1 → promotes full→partial immediately.
+        let freed = first_ptrs.pop().unwrap();
+        let freed_addr = freed.as_ptr() as usize;
+        unsafe { heap.dealloc(freed, layout) };
+
+        // Next alloc: slab2 exhausted → retire → try_partial finds slab1
+        // (promoted during dealloc) → alloc returns the freed slot.
+        let recovered = heap.alloc(layout).unwrap();
+        assert_eq!(
+            recovered.as_ptr() as usize,
+            freed_addr,
+            "should reuse promoted slab1 via partial queue"
+        );
+
+        unsafe { heap.dealloc(recovered, layout) };
+        for ptr in first_ptrs {
+            unsafe { heap.dealloc(ptr, layout) };
+        }
+        for ptr in second_ptrs {
+            unsafe { heap.dealloc(ptr, layout) };
+        }
+    }
+
+    // r[verify heap.dealloc-o1]
+    #[test]
+    fn dealloc_remote_slab_uses_atomic_push() {
         let pool = Arc::new(pool());
         let mut heap = Heap::new(&pool);
         let layout = Layout::from_size_align(64, 1).unwrap();
         let pool2 = Arc::clone(&pool);
 
-        // Allocate from one slab, then free from another thread so the
-        // pointers land in heap2's cache as remote entries.
-        let ptrs: Vec<_> = (0..CACHE_CAP)
-            .map(|_| heap.alloc(layout).unwrap())
-            .collect();
+        let ptrs: Vec<_> = (0..64).map(|_| heap.alloc(layout).unwrap()).collect();
         let raws: Vec<usize> = ptrs.iter().map(|p| p.as_ptr() as usize).collect();
 
         std::thread::spawn(move || {
@@ -803,14 +718,12 @@ mod tests {
                 let ptr = NonNull::new(*raw as *mut u8).unwrap();
                 unsafe { heap2.dealloc(ptr, layout) };
             }
-            // heap2 drops — cache flushed, entries pushed via remote CAS.
         })
         .join()
         .unwrap();
 
-        // Original heap should recover all slots after draining remote.
         heap.drain_remote_all();
-        for _ in 0..CACHE_CAP {
+        for _ in 0..64 {
             let _p = heap.alloc(layout).unwrap();
         }
     }
@@ -935,42 +848,6 @@ mod tests {
         assert_eq!(heap.metrics().class_dealloc_count[idx].load(Relaxed), 2);
     }
 
-    // r[verify metrics.cache-hit-count]
-    #[cfg(feature = "metrics")]
-    #[test]
-    fn metrics_cache_hit_counted() {
-        use core::sync::atomic::Ordering::Relaxed;
-
-        let pool = pool();
-        let mut heap = Heap::new(&pool);
-        let layout = Layout::from_size_align(64, 1).unwrap();
-        let idx = size_class::class_index(layout).unwrap();
-
-        // Fill the first slab to force a second.
-        let first_ptr = heap.alloc(layout).unwrap();
-        let first_slab = unsafe { SlabRef::from_interior_ptr(first_ptr.as_ptr()) };
-        let slot_count = first_slab.slot_count();
-        let mut first_ptrs = vec![first_ptr];
-        for _ in 1..slot_count {
-            first_ptrs.push(heap.alloc(layout).unwrap());
-        }
-
-        // Second slab becomes active.
-        let _second_ptr = heap.alloc(layout).unwrap();
-
-        // Free from first slab → goes to cache.
-        let cached = first_ptrs.pop().unwrap();
-        unsafe { heap.dealloc(cached, layout) };
-
-        let before = heap.metrics().cache_hit_count[idx].load(Relaxed);
-        // Alloc should hit the cache.
-        let _recovered = heap.alloc(layout).unwrap();
-        assert_eq!(
-            heap.metrics().cache_hit_count[idx].load(Relaxed),
-            before + 1
-        );
-    }
-
     // r[verify metrics.large-alloc-count] r[verify metrics.large-alloc-bytes]
     // r[verify metrics.large-dealloc-bytes]
     #[cfg(feature = "metrics")]
@@ -1030,35 +907,6 @@ mod tests {
 
         pool.deregister_heap(h1.metrics.get().cast_const());
         pool.deregister_heap(h2.metrics.get().cast_const());
-    }
-
-    // r[verify metrics.cache-flush-count]
-    #[cfg(feature = "metrics")]
-    #[test]
-    fn metrics_cache_flush_counted() {
-        use core::sync::atomic::Ordering::Relaxed;
-
-        let pool = pool();
-        let mut heap = Heap::new(&pool);
-        let layout = Layout::from_size_align(64, 1).unwrap();
-        let idx = size_class::class_index(layout).unwrap();
-
-        let first_ptr = heap.alloc(layout).unwrap();
-        let first_slab = unsafe { SlabRef::from_interior_ptr(first_ptr.as_ptr()) };
-        let slot_count = first_slab.slot_count();
-        let mut first_ptrs = vec![first_ptr];
-        for _ in 1..slot_count {
-            first_ptrs.push(heap.alloc(layout).unwrap());
-        }
-        let _second_ptr = heap.alloc(layout).unwrap();
-
-        // Fill the cache (CACHE_CAP entries), then one more to trigger flush.
-        for _ in 0..=CACHE_CAP {
-            let cached = first_ptrs.pop().unwrap();
-            unsafe { heap.dealloc(cached, layout) };
-        }
-
-        assert!(heap.metrics().cache_flush_count[idx].load(Relaxed) > 0);
     }
 
     // r[verify metrics.segment-munmap-count]

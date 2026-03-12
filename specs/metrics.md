@@ -100,20 +100,6 @@ Per-size-class counters MUST be stored as independent per-bucket
 values (not cumulative). This avoids multi-bucket atomic updates
 on each allocation.
 
-## Cache effectiveness
-
-r[metrics.cache-hit-count]
-Each thread-local heap MUST maintain a per-size-class cumulative count
-of allocations served directly from the free cache (tcache). Updated
-without atomics. A low hit rate relative to total allocs indicates the
-cache is not absorbing enough reuse.
-
-r[metrics.cache-flush-count]
-Each thread-local heap MUST maintain a per-size-class cumulative count
-of cache flush events (cache overflow causing a batch return to slabs).
-A high flush rate relative to alloc rate indicates `CACHE_CAP` may be
-too small.
-
 ## Thread churn
 
 r[metrics.abandon-count]

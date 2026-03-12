@@ -111,7 +111,7 @@ how to run them, and results.
 
 `class_alloc_count`, `class_dealloc_count`, `class_alloc_bytes`,
 `class_free_bytes`, `class_live_count`, `class_live_bytes`,
-`cache_hit_count`, `cache_flush_count`, `abandon_count`, `adopt_count`
+`abandon_count`, `adopt_count`
 
 **Pool counters**
 

@@ -27,7 +27,6 @@ fn inc(a: &AtomicU64, v: u64) {
 // r[impl metrics.thread-active-bytes]
 // r[impl metrics.class-alloc-count] r[impl metrics.class-dealloc-count]
 // r[impl metrics.class-alloc-bytes] r[impl metrics.class-free-bytes]
-// r[impl metrics.cache-hit-count] r[impl metrics.cache-flush-count]
 // r[impl metrics.large-alloc-count] r[impl metrics.large-alloc-bytes]
 // r[impl metrics.large-dealloc-bytes]
 // r[impl metrics.remote-free-count]
@@ -42,8 +41,6 @@ pub(crate) struct HeapMetrics {
     pub class_dealloc_count: [AtomicU64; NUM_CLASSES],
     pub class_alloc_bytes: [AtomicU64; NUM_CLASSES],
     pub class_free_bytes: [AtomicU64; NUM_CLASSES],
-    pub cache_hit_count: [AtomicU64; NUM_CLASSES],
-    pub cache_flush_count: [AtomicU64; NUM_CLASSES],
     pub remote_free_count: AtomicU64,
     pub large_alloc_count: AtomicU64,
     pub large_alloc_bytes: AtomicU64,
@@ -63,8 +60,6 @@ impl HeapMetrics {
         class_dealloc_count: ZERO_ARRAY,
         class_alloc_bytes: ZERO_ARRAY,
         class_free_bytes: ZERO_ARRAY,
-        cache_hit_count: ZERO_ARRAY,
-        cache_flush_count: ZERO_ARRAY,
         remote_free_count: AtomicU64::new(0),
         large_alloc_count: AtomicU64::new(0),
         large_alloc_bytes: AtomicU64::new(0),
@@ -80,21 +75,11 @@ impl HeapMetrics {
     }
 
     #[inline(always)]
-    pub fn on_cache_hit(&self, idx: usize) {
-        inc(&self.cache_hit_count[idx], 1);
-    }
-
-    #[inline(always)]
     pub fn on_dealloc(&self, idx: usize, class_size: usize) {
         let size = class_size as u64;
         inc(&self.free_bytes, size);
         inc(&self.class_dealloc_count[idx], 1);
         inc(&self.class_free_bytes[idx], size);
-    }
-
-    #[inline(always)]
-    pub fn on_cache_flush(&self, idx: usize) {
-        inc(&self.cache_flush_count[idx], 1);
     }
 
     #[inline(always)]
@@ -129,8 +114,6 @@ impl HeapMetrics {
             *self.class_dealloc_count[i].get_mut() += other.class_dealloc_count[i].load(R);
             *self.class_alloc_bytes[i].get_mut() += other.class_alloc_bytes[i].load(R);
             *self.class_free_bytes[i].get_mut() += other.class_free_bytes[i].load(R);
-            *self.cache_hit_count[i].get_mut() += other.cache_hit_count[i].load(R);
-            *self.cache_flush_count[i].get_mut() += other.cache_flush_count[i].load(R);
         }
     }
 }
@@ -245,9 +228,6 @@ pub struct MetricsSnapshot {
     pub class_live_count: [i64; NUM_CLASSES],
     pub class_live_bytes: [i64; NUM_CLASSES],
 
-    pub cache_hit_count: [u64; NUM_CLASSES],
-    pub cache_flush_count: [u64; NUM_CLASSES],
-
     pub abandon_count: [u64; NUM_CLASSES],
     pub adopt_count: [u64; NUM_CLASSES],
 
@@ -278,8 +258,6 @@ impl MetricsSnapshot {
             class_free_bytes: [0; NUM_CLASSES],
             class_live_count: [0; NUM_CLASSES],
             class_live_bytes: [0; NUM_CLASSES],
-            cache_hit_count: [0; NUM_CLASSES],
-            cache_flush_count: [0; NUM_CLASSES],
             abandon_count: [0; NUM_CLASSES],
             adopt_count: [0; NUM_CLASSES],
             segment_mmap_count: 0,
@@ -305,8 +283,6 @@ impl MetricsSnapshot {
             self.class_dealloc_count[i] += h.class_dealloc_count[i].load(R);
             self.class_alloc_bytes[i] += h.class_alloc_bytes[i].load(R);
             self.class_free_bytes[i] += h.class_free_bytes[i].load(R);
-            self.cache_hit_count[i] += h.cache_hit_count[i].load(R);
-            self.cache_flush_count[i] += h.cache_flush_count[i].load(R);
         }
     }
 

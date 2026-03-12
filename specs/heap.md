@@ -19,9 +19,9 @@ The heap MUST maintain one bin per size class. Each bin holds a pointer to
 the currently active slab for that class.
 
 r[heap.alloc-fast-path]
-Allocation MUST first attempt to pop from the active slab's local free list.
-If the local list is empty, the heap MUST drain the slab's remote free list
-before requesting a new slab.
+Allocation MUST first attempt to pop from the active slab's local free list
+(no atomics). If the local list is empty, the heap MUST drain the slab's
+remote free list before requesting a new slab.
 
 r[heap.slab-request]
 When the active slab is fully allocated and its remote free list is also
@@ -29,27 +29,27 @@ empty, the heap MUST request a new slab from the global page pool and make
 it the active slab for that size class.
 
 r[heap.page-queue]
-Non-active slabs MUST be tracked in two per-class queues: a full queue
-(exhausted slabs awaiting remote frees) and a partial queue (slabs with
-known free slots). When the active slab is exhausted, the heap MUST first
-try to pop from the partial queue (O(1)). If the partial queue is empty,
-the heap MUST scan the full queue, draining remote frees on each slab,
-and move all discovered partial slabs to the partial queue in one pass.
-This amortises the scan cost across multiple subsequent allocations.
+Non-active slabs MUST be tracked in two per-class doubly-linked queues:
+a full queue (exhausted slabs awaiting remote frees) and a partial queue
+(slabs with known free slots). Each slab carries a back-pointer to its
+predecessor's next-link, enabling O(1) removal from any position. When
+the active slab is exhausted, the heap MUST first try to pop from the
+partial queue (O(1)). If the partial queue is empty, the heap MUST scan
+the full queue, draining remote frees on each slab, and move all discovered
+partial slabs to the partial queue in one pass.
+
+r[heap.dealloc-promote]
+When a local deallocation causes a full-queue slab to gain its first free
+slot, the heap MUST promote it to the partial queue (or make it active)
+in O(1) using the doubly-linked list back-pointer.
 
 r[heap.dealloc-o1]
-Deallocation MUST be O(1). If the pointer belongs to the active slab for its
-size class, the heap MUST use the local free list (no atomics). Otherwise the
-heap MUST push the pointer into the free cache. The heap MUST NOT walk
-any slab queue during deallocation.
-
-r[heap.free-cache]
-The heap MUST maintain a per-size-class free cache that absorbs non-active-slab
-frees without atomic operations. Allocation MUST check the cache before the
-slab. When the cache overflows, it MUST be flushed in batch: own-slab entries
-go to the local free list directly; remote entries are chained per-slab and
-pushed with a single atomic CAS per slab. The cache MUST be flushed before
-thread exit.
+Deallocation MUST be O(1). If the pointer belongs to any slab owned by this
+heap, the heap MUST push directly to the slab's local free list (no atomics)
+and perform any resulting list promotion in O(1). If the slab belongs to a
+different heap, the heap MUST push to the slab's remote free list (one
+atomic CAS). The heap MUST NOT walk any slab queue or batch frees during
+deallocation.
 
 ## Cleanup
 

@@ -6,10 +6,12 @@
 /// the same slots — so the successor frees memory allocated by its predecessor.
 /// This exercises cross-thread deallocation paths in the allocator.
 ///
-/// Usage: cargo bench --bench larson -- [duration_secs min_size max_size chunks_per_thread num_rounds seed num_threads]
-/// Default: 5s, 256-4096 bytes, 1000 chunks/thread, 100 rounds, seed 4141, threads=CPUs
+/// Usage: cargo bench --bench larson -- [duration_secs min_size max_size chunks_per_thread num_rounds seed num_threads runs]
+/// Default: 5s, 256-4096 bytes, 1000 chunks/thread, 100 rounds, seed 4141, threads=CPUs, 3 runs
 mod alloc_setup;
+mod bench_stats;
 
+use bench_stats::RunStats;
 use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::mem::MaybeUninit;
@@ -72,11 +74,9 @@ fn exercise_heap(state: &mut ThreadState) {
     for _ in 0..total_ops {
         let victim = state.rng.random_range(0..asize);
 
-        // Drop existing block, allocate replacement
         let mut block = random_block(&mut state.rng, state.min_size, state.max_size);
         touch(&mut block);
 
-        // Swap in the new block — the old one is dropped (freed) here
         std::mem::swap(&mut state.blocks[victim], &mut block);
         drop(block);
 
@@ -96,7 +96,6 @@ fn thread_chain(mut state: ThreadState, result_tx: mpsc::Sender<ThreadResult>) {
     exercise_heap(&mut state);
 
     if STOP.load(Ordering::Relaxed) {
-        // Blocks are dropped automatically when state goes out of scope
         let _ = result_tx.send(ThreadResult {
             allocs: state.allocs,
             frees: state.frees,
@@ -115,13 +114,11 @@ fn warmup(
 ) {
     let num_chunks = blocks.len();
 
-    // Fisher-Yates shuffle
     for i in (1..num_chunks).rev() {
         let j = rng.random_range(0..i);
         blocks.swap(i, j);
     }
 
-    // 4x replace rounds to warm up the allocator
     for _ in 0..4 * num_chunks {
         let victim = rng.random_range(0..num_chunks);
         let mut block = random_block(rng, min_size, max_size);
@@ -130,40 +127,31 @@ fn warmup(
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+struct TrialResult {
+    ops_per_sec: f64,
+    total_allocs: u64,
+    total_generations: u64,
+    elapsed: f64,
+}
 
-    let (duration_secs, min_size, max_size, chunks_per_thread, num_rounds, seed, num_threads) =
-        if args.len() > 7 {
-            (
-                args[1].parse::<u64>().unwrap(),
-                args[2].parse::<usize>().unwrap(),
-                args[3].parse::<usize>().unwrap(),
-                args[4].parse::<usize>().unwrap(),
-                args[5].parse::<usize>().unwrap(),
-                args[6].parse::<u64>().unwrap(),
-                args[7].parse::<usize>().unwrap(),
-            )
-        } else {
-            let cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            (5, 256, 4096, 1000, 100, 4141u64, cpus)
-        };
-
-    assert!(min_size >= 1, "min_size must be >= 1");
-    assert!(max_size >= min_size, "max_size must be >= min_size");
-
-    STOP.store(false, Ordering::SeqCst);
-
+fn run_trial(
+    duration_secs: u64,
+    min_size: usize,
+    max_size: usize,
+    chunks_per_thread: usize,
+    num_rounds: usize,
+    num_threads: usize,
+    rng: &mut Xoshiro256PlusPlus,
+) -> TrialResult {
     let total_chunks = num_threads * chunks_per_thread;
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
 
     let mut all_blocks: Vec<Box<[MaybeUninit<u64>]>> = (0..total_chunks)
-        .map(|_| random_block(&mut rng, min_size, max_size))
+        .map(|_| random_block(rng, min_size, max_size))
         .collect();
 
-    warmup(&mut all_blocks, min_size, max_size, &mut rng);
+    warmup(&mut all_blocks, min_size, max_size, rng);
+
+    STOP.store(false, Ordering::SeqCst);
 
     let mut receivers = Vec::with_capacity(num_threads);
     let mut drain = all_blocks.into_iter();
@@ -209,14 +197,69 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64();
     let total_ops = total_allocs + total_frees;
 
+    TrialResult {
+        ops_per_sec: total_ops as f64 / elapsed,
+        total_allocs,
+        total_generations,
+        elapsed,
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let (duration_secs, min_size, max_size, chunks_per_thread, num_rounds, seed, num_threads, runs) =
+        if args.len() > 8 {
+            (
+                args[1].parse::<u64>().unwrap(),
+                args[2].parse::<usize>().unwrap(),
+                args[3].parse::<usize>().unwrap(),
+                args[4].parse::<usize>().unwrap(),
+                args[5].parse::<usize>().unwrap(),
+                args[6].parse::<u64>().unwrap(),
+                args[7].parse::<usize>().unwrap(),
+                args[8].parse::<usize>().unwrap(),
+            )
+        } else {
+            (5, 256, 4096, 1000, 100, 4141u64, cpus, 3)
+        };
+
+    assert!(min_size >= 1, "min_size must be >= 1");
+    assert!(max_size >= min_size, "max_size must be >= min_size");
+    assert!(runs >= 1, "runs must be >= 1");
+
     println!("larson benchmark ({})", alloc_setup::allocator_name());
     println!("  threads:      {num_threads}");
     println!("  size range:   {min_size}-{max_size} bytes");
     println!("  chunks/thr:   {chunks_per_thread}");
     println!("  rounds/gen:   {num_rounds}");
-    println!("  duration:     {elapsed:.3}s");
-    println!("  allocs:       {total_allocs}");
-    println!("  frees:        {total_frees}");
-    println!("  generations:  {total_generations}");
-    println!("  throughput:   {:.0} ops/sec", total_ops as f64 / elapsed);
+    println!("  runs:         {runs}");
+
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let mut stats = RunStats::new();
+
+    for run in 1..=runs {
+        let result = run_trial(
+            duration_secs,
+            min_size,
+            max_size,
+            chunks_per_thread,
+            num_rounds,
+            num_threads,
+            &mut rng,
+        );
+
+        let m_ops = result.ops_per_sec / 1_000_000.0;
+        println!(
+            "  run {run}/{runs}:    {m_ops:.1} M ops/sec  ({:.3}s, {} allocs, {} gens)",
+            result.elapsed, result.total_allocs, result.total_generations,
+        );
+        stats.push(result.ops_per_sec / 1_000_000.0);
+    }
+
+    stats.print("throughput", "M ops/sec");
 }

@@ -31,9 +31,8 @@ MUST push the pointer onto the slab's local free list without atomic operations.
 
 r[dealloc.remote-path]
 When the slab owning the pointer belongs to a different thread, `dealloc`
-MUST route the pointer through the heap's free cache. The cache flush MUST
-deliver remote entries to the slab's atomic remote free list using a
-lock-free compare-and-swap loop.
+MUST push the pointer directly onto the slab's atomic remote free list
+using a single lock-free compare-and-swap.
 
 ## Post-exit deallocation
 

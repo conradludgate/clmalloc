@@ -15,36 +15,55 @@ const MAX_SLAB_SIZE: usize = 32768;
 /// Total number of slab-served size classes.
 pub const NUM_CLASSES: usize = NUM_REGULAR + 1;
 
-// r[impl size-class.lookup] r[impl size-class.round-up] r[impl size-class.alignment] r[impl size-class.dealloc-index]
-/// Returns the size class index for a layout, or `None` for large allocations.
-///
-/// O(1) via bit arithmetic. Rounds size up to the next multiple of `align`,
-/// then finds the smallest size class that fits.
-#[inline]
-pub fn class_index(layout: Layout) -> Option<usize> {
-    let size = layout.size().next_multiple_of(layout.align()).max(MIN_SIZE);
-
-    if size > MAX_SLAB_SIZE {
-        return None;
+/// Bit-arithmetic class index from a pre-clamped size. Used to build the
+/// lookup table at compile time and as the reference implementation for tests.
+#[allow(clippy::cast_possible_truncation)]
+const fn class_index_from_size(size: usize) -> u8 {
+    assert!(size >= MIN_SIZE && size <= MAX_SLAB_SIZE);
+    if size >= MAX_SLAB_SIZE {
+        return NUM_REGULAR as u8;
     }
-    if size == MAX_SLAB_SIZE {
-        return Some(NUM_REGULAR);
-    }
-
     let k = (usize::BITS - 1 - size.leading_zeros()) as usize;
     let base = 1usize << k;
     let step = base >> 2;
     let j = (size - base).div_ceil(step);
-
     if j >= SUB_STEPS {
         let next_k = k + 1;
         if next_k > MAX_K {
-            return Some(NUM_REGULAR);
+            return NUM_REGULAR as u8;
         }
-        return Some((next_k - MIN_K) * SUB_STEPS);
+        return ((next_k - MIN_K) * SUB_STEPS) as u8;
     }
+    ((k - MIN_K) * SUB_STEPS + j) as u8
+}
 
-    Some((k - MIN_K) * SUB_STEPS + j)
+/// Precomputed table mapping effective allocation size to class index.
+/// Indexed by `(size - 1) >> 1` (2-byte granularity). This works because all
+/// class boundaries fall on even sizes (steps are powers of 2, minimum 2).
+static CLASS_TABLE: [u8; MAX_SLAB_SIZE / 2] = {
+    let mut table = [0u8; MAX_SLAB_SIZE / 2];
+    let mut i = 0;
+    while i < MAX_SLAB_SIZE / 2 {
+        let size = (i + 1) * 2;
+        let clamped = if size < MIN_SIZE { MIN_SIZE } else { size };
+        table[i] = class_index_from_size(clamped);
+        i += 1;
+    }
+    table
+};
+
+// r[impl size-class.lookup] r[impl size-class.round-up] r[impl size-class.alignment] r[impl size-class.dealloc-index]
+/// Returns the size class index for a layout, or `None` for large allocations.
+///
+/// O(1) via table lookup. Rounds size up to the next multiple of `align`,
+/// then indexes into the precomputed class table.
+#[inline]
+pub fn class_index(layout: Layout) -> Option<usize> {
+    let size = layout.size().next_multiple_of(layout.align()).max(MIN_SIZE);
+    if size > MAX_SLAB_SIZE {
+        return None;
+    }
+    Some(CLASS_TABLE[(size - 1) >> 1] as usize)
 }
 
 // r[impl size-class.small] r[impl size-class.medium] r[impl size-class.large]

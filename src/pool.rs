@@ -1,8 +1,9 @@
 //! Global page pool: manages OS memory and distributes slabs to heaps.
 //!
-//! All pool state (free slab lists + segment carving) is protected by a
-//! single `spin::Mutex`. This is a cold path — accessed only when a heap
-//! needs a new slab or returns one — so lock-free complexity is unnecessary.
+//! Free slab lists and segment carving are protected by a single
+//! `spin::Mutex`. Abandoned slab lists (per size class) use lock-free
+//! atomic operations — CAS push for abandon, atomic swap for bulk adopt —
+//! to avoid mutex contention during thread exit/start churn.
 //!
 //! Returned slabs go onto a **dirty list** (pages still resident). When the
 //! dirty count exceeds a high-water mark, excess slabs are purged in batch
@@ -14,7 +15,8 @@ use core::mem::{align_of, size_of};
 use core::ptr::{NonNull, null_mut};
 
 use crate::size_class::NUM_CLASSES;
-use crate::slab::{SLAB_SIZE, Slab, SlabBase, SlabList, slab_list_pop, slab_list_push};
+use crate::slab::{SLAB_SIZE, Slab, SlabBase};
+use crate::sync::{AtomicPtr, Ordering};
 use crate::sys::PageAllocator;
 
 pub(crate) const SEGMENT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
@@ -84,7 +86,6 @@ impl PageFreeList {
 struct PoolState {
     dirty_list: PageFreeList,
     clean_list: PageFreeList,
-    abandoned_heads: [SlabList; NUM_CLASSES],
     segment_cursor: Link,
     segment_end: Link,
     /// Index into `segments[]` for the segment currently being carved.
@@ -109,9 +110,17 @@ struct PoolState {
 unsafe impl Send for PoolState {}
 
 // r[impl pool.thread-safe] r[impl pool.alloc-slab] r[impl slab.alloc-from-pool]
+// r[impl pool.lockfree-abandon]
 pub struct PagePool<P: PageAllocator> {
     page_alloc: P,
     state: spin::Mutex<PoolState>,
+    /// Per-class lock-free abandoned slab lists (Treiber stacks).
+    /// CAS push for abandon, atomic swap for bulk adopt.
+    abandoned: [AtomicPtr<SlabBase>; NUM_CLASSES],
+    /// Lock-free cache of fully-free slab pages (Treiber stack).
+    /// Bypasses the pool mutex for the common alloc/dealloc-slab cycle.
+    slab_cache: AtomicPtr<SlabBase>,
+    slab_cache_len: crate::sync::AtomicUsize,
 }
 
 unsafe impl<P: PageAllocator> Send for PagePool<P> {}
@@ -124,7 +133,6 @@ impl<P: PageAllocator> PagePool<P> {
             state: spin::Mutex::new(PoolState {
                 dirty_list: PageFreeList::EMPTY,
                 clean_list: PageFreeList::EMPTY,
-                abandoned_heads: [None; NUM_CLASSES],
                 segment_cursor: null_mut::<SlabPage>(),
                 segment_end: null_mut::<SlabPage>(),
                 carving_idx: 0,
@@ -138,6 +146,11 @@ impl<P: PageAllocator> PagePool<P> {
                 #[cfg(feature = "metrics")]
                 metrics: crate::metrics::PoolMetrics::new(),
             }),
+            // SAFETY: AtomicPtr<T> has the same layout as *mut T;
+            // zeroed memory represents null pointers (empty lists).
+            abandoned: unsafe { core::mem::zeroed() },
+            slab_cache: AtomicPtr::new(null_mut()),
+            slab_cache_len: crate::sync::AtomicUsize::new(0),
         }
     }
 
@@ -399,37 +412,98 @@ impl<P: PageAllocator> PagePool<P> {
 
     /// Place a non-fully-free slab on the abandoned list for its size class.
     ///
-    /// Called during thread exit when a slab still has outstanding allocations.
-    /// Another heap can later adopt it via `adopt_slab`.
+    /// Lock-free CAS push onto a per-class Treiber stack. No mutex.
     #[cold]
     pub fn abandon_slab(&self, slab: Slab) {
         let class_idx = slab.size_class_index();
-        let mut state = self.state.lock();
+        let base = slab.into_raw();
+        let mut slab = unsafe { Slab::from_raw(base) };
+        let head = &self.abandoned[class_idx];
+
+        let mut current = head.load(Ordering::Relaxed);
+        loop {
+            slab.set_next_link(NonNull::new(current));
+            match head.compare_exchange_weak(
+                current,
+                base.as_ptr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+
         #[cfg(feature = "metrics")]
         {
-            state.metrics.pool_lock_count += 1;
+            let mut state = self.state.lock();
             state.metrics.abandon_count[class_idx] += 1;
         }
-        slab_list_push(&mut state.abandoned_heads[class_idx], slab);
     }
 
-    /// Try to adopt an abandoned slab for the given size class.
+    /// Atomically take the entire abandoned list for a size class.
     ///
-    /// Returns the slab with ownership transferred to the caller.
-    /// The caller must `drain_remote` and `set_heap_id` before use.
+    /// Returns the head of the chain; caller walks via `next_link()`.
     #[cold]
-    pub fn adopt_slab(&self, class_idx: usize) -> Option<Slab> {
-        let mut state = self.state.lock();
-        #[cfg(feature = "metrics")]
-        {
-            state.metrics.pool_lock_count += 1;
+    pub fn adopt_all(&self, class_idx: usize) -> Option<Slab> {
+        let head = &self.abandoned[class_idx];
+        if head.load(Ordering::Relaxed).is_null() {
+            return None;
         }
-        state.abandoned_heads[class_idx]?;
-        #[cfg(feature = "metrics")]
-        {
-            state.metrics.adopt_count[class_idx] += 1;
+        let old = head.swap(null_mut(), Ordering::Acquire);
+        NonNull::new(old).map(|base| unsafe { Slab::from_raw(base) })
+    }
+
+    const SLAB_CACHE_MAX: usize = 512;
+
+    /// Lock-free CAS push of a fully-free slab page onto the global cache.
+    /// Falls back to the mutex-guarded `dealloc_slab` when the cache is full.
+    // r[impl pool.slab-cache]
+    pub fn cache_slab(&self, base: NonNull<SlabBase>) {
+        if self.slab_cache_len.load(Ordering::Relaxed) >= Self::SLAB_CACHE_MAX {
+            self.dealloc_slab(base);
+            return;
         }
-        slab_list_pop(&mut state.abandoned_heads[class_idx])
+        let ptr = base.as_ptr();
+        let mut current = self.slab_cache.load(Ordering::Relaxed);
+        loop {
+            unsafe { ptr.cast::<*mut SlabBase>().write(current) };
+            match self.slab_cache.compare_exchange_weak(
+                current,
+                ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.slab_cache_len.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Lock-free CAS pop of a slab page from the global cache.
+    /// Falls back to the mutex-guarded `alloc_slab` on cache miss.
+    // r[impl pool.slab-cache]
+    pub fn uncache_slab(&self) -> Option<NonNull<SlabBase>> {
+        let mut head = self.slab_cache.load(Ordering::Acquire);
+        loop {
+            let head_nn = NonNull::new(head)?;
+            let next = unsafe { head.cast::<*mut SlabBase>().read() };
+            match self.slab_cache.compare_exchange_weak(
+                head,
+                next,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.slab_cache_len.fetch_sub(1, Ordering::Relaxed);
+                    return Some(head_nn);
+                }
+                Err(actual) => head = actual,
+            }
+        }
     }
 
     // r[impl pool.large-alloc]
@@ -464,6 +538,10 @@ impl<P: PageAllocator> PagePool<P> {
 
 #[cfg(feature = "metrics")]
 impl<P: PageAllocator> PagePool<P> {
+    pub fn inc_adopt_count(&self, class_idx: usize) {
+        self.state.lock().metrics.adopt_count[class_idx] += 1;
+    }
+
     pub fn register_heap(&self, ptr: *const crate::metrics::HeapMetrics) {
         self.state.lock().metrics.register_heap(ptr);
     }
@@ -492,6 +570,11 @@ impl<P: PageAllocator> PagePool<P> {
 
 impl<P: PageAllocator> Drop for PagePool<P> {
     fn drop(&mut self) {
+        // Drain the lock-free slab cache back through dealloc_slab so
+        // seg_outstanding counts remain consistent for segment release.
+        while let Some(slab) = self.uncache_slab() {
+            self.dealloc_slab(slab);
+        }
         let state = self.state.get_mut();
         for i in 0..state.segment_count {
             let segment = state.segments[i];
@@ -648,7 +731,10 @@ mod tests {
                         SLAB_SIZE - link_size,
                     )
                 };
-                assert!(slice.iter().all(|&b| b == 0), "purged slab should be zeroed");
+                assert!(
+                    slice.iter().all(|&b| b == 0),
+                    "purged slab should be zeroed"
+                );
                 found = true;
                 reallocs.push(s);
                 break;
@@ -742,6 +828,55 @@ mod tests {
             .collect();
         for t in threads {
             t.join().unwrap();
+        }
+    }
+
+    // r[verify pool.lockfree-abandon]
+    #[test]
+    fn concurrent_abandon_adopt() {
+        use std::sync::{Arc, Barrier};
+
+        let pool = Arc::new(pool());
+        let barrier = Arc::new(Barrier::new(8));
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let pool = Arc::clone(&pool);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let class_idx = 0;
+                    barrier.wait();
+
+                    if i % 2 == 0 {
+                        // Abandoner: alloc a slab, init it, abandon it.
+                        let raw = pool.alloc_slab().unwrap();
+                        let slab = unsafe { Slab::init(raw, class_idx, 999 + i) };
+                        pool.abandon_slab(slab);
+                    } else {
+                        // Adopter: try to adopt and return anything found.
+                        let mut adopted = pool.adopt_all(class_idx as usize);
+                        while let Some(mut slab) = adopted {
+                            let next = slab.next_link();
+                            slab.set_next_link(None);
+                            pool.dealloc_slab(slab.into_raw());
+                            adopted = next.map(|b| unsafe { Slab::from_raw(b) });
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // Drain any remaining abandoned slabs.
+        let mut remaining = pool.adopt_all(0);
+        while let Some(mut slab) = remaining {
+            let next = slab.next_link();
+            slab.set_next_link(None);
+            pool.dealloc_slab(slab.into_raw());
+            remaining = next.map(|b| unsafe { Slab::from_raw(b) });
         }
     }
 }
